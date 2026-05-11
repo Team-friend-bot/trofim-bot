@@ -1,3 +1,4 @@
+import asyncio
 import os
 import json
 import logging
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 OWNER_ID = int(os.environ["OWNER_ID"])
+
+logger.info(f"Bot starting. OWNER_ID={OWNER_ID}")
 
 db = Database()
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -54,13 +57,19 @@ def parse_task_with_claude(message_text: str) -> dict:
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-    if update.message.from_user.id != OWNER_ID:
+
+    user_id = update.message.from_user.id
+    logger.info(f"Message from user_id={user_id}, OWNER_ID={OWNER_ID}")
+
+    if user_id != OWNER_ID:
         return
 
     text = update.message.text
     chat_id = update.message.chat_id
+    logger.info(f"Processing message: {text[:50]}")
 
-    result = parse_task_with_claude(text)
+    result = await asyncio.to_thread(parse_task_with_claude, text)
+    logger.info(f"Claude result: {result}")
 
     if result.get("has_task") and result.get("deadline") and result.get("assignee"):
         task_id = db.add_task(
