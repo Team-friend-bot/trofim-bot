@@ -24,13 +24,26 @@ class Database:
                     created_by TEXT,
                     created_at TEXT DEFAULT (datetime('now')),
                     is_done INTEGER DEFAULT 0,
-                    reminded_24h INTEGER DEFAULT 0,
-                    reminded_0h INTEGER DEFAULT 0,
+                    done_at TEXT,
+                    reminded_1d INTEGER DEFAULT 0,
+                    reminded_2h INTEGER DEFAULT 0,
+                    reminded_15m INTEGER DEFAULT 0,
                     reminded_overdue INTEGER DEFAULT 0
                 )
             """)
+            for col, col_type in [
+                ("done_at", "TEXT"),
+                ("reminded_1d", "INTEGER DEFAULT 0"),
+                ("reminded_2h", "INTEGER DEFAULT 0"),
+                ("reminded_15m", "INTEGER DEFAULT 0"),
+                ("reminded_overdue", "INTEGER DEFAULT 0"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {col_type}")
+                except sqlite3.OperationalError:
+                    pass
 
-    def add_task(self, chat_id: int, task_text: str, assignee: str, deadline: str, created_by: str) -> int:
+    def add_task(self, chat_id, task_text, assignee, deadline, created_by):
         with self._get_conn() as conn:
             cursor = conn.execute(
                 "INSERT INTO tasks (chat_id, task_text, assignee, deadline, created_by) VALUES (?, ?, ?, ?, ?)",
@@ -38,7 +51,7 @@ class Database:
             )
             return cursor.lastrowid
 
-    def get_active_tasks(self, chat_id: int) -> List[Dict]:
+    def get_active_tasks(self, chat_id):
         with self._get_conn() as conn:
             rows = conn.execute(
                 "SELECT * FROM tasks WHERE chat_id = ? AND is_done = 0 ORDER BY deadline",
@@ -46,25 +59,34 @@ class Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def get_tasks_for_reminder(self) -> List[Dict]:
+    def get_tasks_for_reminder(self):
         with self._get_conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM tasks WHERE is_done = 0"
-            ).fetchall()
+            rows = conn.execute("SELECT * FROM tasks WHERE is_done = 0").fetchall()
             return [dict(row) for row in rows]
 
-    def mark_done(self, task_id: int):
+    def mark_done(self, task_id):
         with self._get_conn() as conn:
-            conn.execute("UPDATE tasks SET is_done = 1 WHERE id = ?", (task_id,))
+            conn.execute(
+                "UPDATE tasks SET is_done = 1, done_at = datetime('now') WHERE id = ?",
+                (task_id,)
+            )
 
-    def mark_reminded_24h(self, task_id: int):
+    def mark_reminded(self, task_id, field):
         with self._get_conn() as conn:
-            conn.execute("UPDATE tasks SET reminded_24h = 1 WHERE id = ?", (task_id,))
+            conn.execute(f"UPDATE tasks SET {field} = 1 WHERE id = ?", (task_id,))
 
-    def mark_reminded_0h(self, task_id: int):
+    def get_stats(self, chat_id):
         with self._get_conn() as conn:
-            conn.execute("UPDATE tasks SET reminded_0h = 1 WHERE id = ?", (task_id,))
-
-    def mark_reminded_overdue(self, task_id: int):
-        with self._get_conn() as conn:
-            conn.execute("UPDATE tasks SET reminded_overdue = 1 WHERE id = ?", (task_id,))
+            rows = conn.execute("""
+                SELECT 
+                    assignee,
+                    COUNT(*) as total,
+                    SUM(CASE WHEN is_done = 1 THEN 1 ELSE 0 END) as done,
+                    SUM(CASE WHEN is_done = 1 AND done_at <= deadline THEN 1 ELSE 0 END) as on_time,
+                    SUM(CASE WHEN is_done = 1 AND done_at > deadline THEN 1 ELSE 0 END) as late,
+                    SUM(CASE WHEN is_done = 0 AND deadline < datetime('now') THEN 1 ELSE 0 END) as overdue
+                FROM tasks
+                WHERE chat_id = ?
+                GROUP BY assignee
+            """, (chat_id,)).fetchall()
+            return [dict(row) for row in rows]
