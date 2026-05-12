@@ -31,17 +31,15 @@ class Database:
                     reminded_overdue INTEGER DEFAULT 0
                 )
             """)
-            for col, col_type in [
-                ("done_at", "TEXT"),
-                ("reminded_1d", "INTEGER DEFAULT 0"),
-                ("reminded_2h", "INTEGER DEFAULT 0"),
-                ("reminded_15m", "INTEGER DEFAULT 0"),
-                ("reminded_overdue", "INTEGER DEFAULT 0"),
-            ]:
-                try:
-                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {col_type}")
-                except sqlite3.OperationalError:
-                    pass
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS members (
+                    chat_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    username TEXT,
+                    user_id INTEGER,
+                    PRIMARY KEY (chat_id, name)
+                )
+            """)
 
     def add_task(self, chat_id, task_text, assignee, deadline, created_by):
         with self._get_conn() as conn:
@@ -85,8 +83,43 @@ class Database:
                     SUM(CASE WHEN is_done = 1 AND done_at <= deadline THEN 1 ELSE 0 END) as on_time,
                     SUM(CASE WHEN is_done = 1 AND done_at > deadline THEN 1 ELSE 0 END) as late,
                     SUM(CASE WHEN is_done = 0 AND deadline < datetime('now') THEN 1 ELSE 0 END) as overdue
-                FROM tasks
-                WHERE chat_id = ?
-                GROUP BY assignee
+                FROM tasks WHERE chat_id = ? GROUP BY assignee
             """, (chat_id,)).fetchall()
             return [dict(row) for row in rows]
+
+    def add_member(self, chat_id, name, username, user_id=None):
+        with self._get_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO members (chat_id, name, username, user_id) VALUES (?, ?, ?, ?)",
+                (chat_id, name, username, user_id)
+            )
+
+    def get_member(self, chat_id, name):
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM members WHERE chat_id = ? AND LOWER(name) = LOWER(?)",
+                (chat_id, name)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_team(self, chat_id):
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM members WHERE chat_id = ? ORDER BY name",
+                (chat_id,)
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def remove_member(self, chat_id, name):
+        with self._get_conn() as conn:
+            conn.execute(
+                "DELETE FROM members WHERE chat_id = ? AND LOWER(name) = LOWER(?)",
+                (chat_id, name)
+            )
+
+    def update_user_id_by_username(self, username, user_id):
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE members SET user_id = ? WHERE LOWER(username) = LOWER(?)",
+                (user_id, username)
+            )
