@@ -110,7 +110,7 @@ def parse_voice_with_gemini(audio_path: str) -> dict:
 - Час за замовчуванням 18:00 якщо не вказано
 - has_task: false якщо немає імені АБО немає дати"""
 
-    audio_file = genai.upload_file(audio_path)
+    audio_file = genai.upload_file(audio_path, mime_type="audio/ogg")
     response = gemini_model.generate_content([prompt, audio_file])
     raw = response.text
     logger.info(f"Gemini raw: {raw}")
