@@ -1,14 +1,19 @@
 import asyncio
 import os
+import json
 import logging
-from datetime import datetime
+from datetime import datetime, date
 
+import anthropic
+import google.generativeai as genai
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 from database import Database
@@ -17,11 +22,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 OWNER_ID = int(os.environ["OWNER_ID"])
 
 logger.info(f"Bot starting. OWNER_ID={OWNER_ID}")
 
 db = Database()
+claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 
 
 def parse_deadline(s: str) -> datetime:
@@ -35,6 +45,153 @@ def parse_deadline(s: str) -> datetime:
         except ValueError:
             continue
     raise ValueError(f"Cannot parse: {s}")
+
+
+def parse_task_with_claude(message_text: str) -> dict:
+    today = date.today().isoformat()
+    response = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=400,
+        system=f"""Ти асистент менеджера команди. Сьогодні {today}.
+
+Розпізнавай делегування задач членам команди в повідомленнях.
+
+Поверни ТІЛЬКИ JSON без пояснень:
+{{
+  "has_task": true/false,
+  "assignee": "ім'я або null",
+  "task": "опис задачі або null",
+  "deadline": "YYYY-MM-DDTHH:MM:SS або null"
+}}
+
+ПРАВИЛА:
+- Якщо є ім'я + дія + дата/час → has_task: true
+- "20 травня" → YYYY-05-20 (поточний рік)
+- "завтра" → завтрашня дата
+- "п'ятниця" → найближча п'ятниця
+- Час за замовчуванням 18:00 якщо не вказано
+- has_task: false якщо немає імені АБО немає дати
+
+ПРИКЛАДИ:
+"Андрій підготуй звіт до 20 травня" → {{"has_task": true, "assignee": "Андрій", "task": "підготувати звіт", "deadline": "2026-05-20T18:00:00"}}
+"Сергій зроби аналіз до п'ятниці 15:00" → {{"has_task": true, "assignee": "Сергій", "task": "зробити аналіз", "deadline": "2026-05-15T15:00:00"}}
+"Команда, обговоримо завтра" → {{"has_task": false, "assignee": null, "task": null, "deadline": null}}""",
+        messages=[{"role": "user", "content": message_text}],
+    )
+    raw = response.content[0].text
+    logger.info(f"Claude raw: {raw}")
+    try:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(raw[start:end+1])
+    except Exception as e:
+        logger.error(f"Parse error: {e}")
+    return {"has_task": False}
+
+
+def parse_voice_with_gemini(audio_path: str) -> dict:
+    today = date.today().isoformat()
+    prompt = f"""Сьогодні {today}.
+Прослухай голосове повідомлення українською і витягни задачу.
+
+Поверни ТІЛЬКИ JSON без пояснень:
+{{
+  "has_task": true/false,
+  "assignee": "ім'я або null",
+  "task": "опис задачі або null",
+  "deadline": "YYYY-MM-DDTHH:MM:SS або null"
+}}
+
+ПРАВИЛА:
+- Якщо є ім'я + дія + дата/час → has_task: true
+- "20 травня" → YYYY-05-20 (поточний рік {today[:4]})
+- "завтра" → завтрашня дата
+- Час за замовчуванням 18:00 якщо не вказано
+- has_task: false якщо немає імені АБО немає дати"""
+
+    audio_file = genai.upload_file(audio_path)
+    response = gemini_model.generate_content([prompt, audio_file])
+    raw = response.text
+    logger.info(f"Gemini raw: {raw}")
+    try:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(raw[start:end+1])
+    except Exception as e:
+        logger.error(f"Gemini parse error: {e}")
+    return {"has_task": False}
+
+
+async def save_and_reply(update: Update, result: dict, source: str = ""):
+    if not (result.get("has_task") and result.get("deadline") and result.get("assignee")):
+        return False
+
+    try:
+        deadline = datetime.fromisoformat(result["deadline"])
+    except (ValueError, TypeError):
+        return False
+
+    task_id = db.add_task(
+        chat_id=update.message.chat_id,
+        task_text=result["task"],
+        assignee=result["assignee"],
+        deadline=deadline.isoformat(),
+        created_by=update.message.from_user.first_name,
+    )
+
+    suffix = f" ({source})" if source else ""
+    await update.message.reply_text(
+        f"✅ Задача #{task_id} зафіксована{suffix}\n"
+        f"👤 {result['assignee']}\n"
+        f"📋 {result['task']}\n"
+        f"📅 {deadline.strftime('%d.%m.%Y %H:%M')}"
+    )
+    return True
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    if update.message.from_user.id != OWNER_ID:
+        return
+
+    text = update.message.text
+    logger.info(f"Processing: {text[:60]}")
+    result = await asyncio.to_thread(parse_task_with_claude, text)
+    logger.info(f"Result: {result}")
+    await save_and_reply(update, result)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.voice:
+        return
+    if update.message.from_user.id != OWNER_ID:
+        return
+
+    voice = update.message.voice
+    audio_path = f"/tmp/{voice.file_id}.ogg"
+
+    try:
+        file = await context.bot.get_file(voice.file_id)
+        await file.download_to_drive(audio_path)
+        logger.info(f"Voice downloaded: {audio_path}")
+
+        result = await asyncio.to_thread(parse_voice_with_gemini, audio_path)
+        logger.info(f"Voice result: {result}")
+
+        saved = await save_and_reply(update, result, source="з голосу")
+        if not saved:
+            await update.message.reply_text(
+                "🎤 Не вдалось розпізнати задачу. Спробуй чіткіше назвати ім'я і дедлайн."
+            )
+    except Exception as e:
+        logger.error(f"Voice error: {e}")
+        await update.message.reply_text(f"❌ Помилка обробки голосу: {e}")
+    finally:
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
 
 
 async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -57,9 +214,7 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         deadline = parse_deadline(deadline_str)
     except ValueError:
-        await update.message.reply_text(
-            "❌ Невірний формат дати.\nПриклад: 20.05.2026 17:00"
-        )
+        await update.message.reply_text("❌ Невірний формат дати.\nПриклад: 20.05.2026 17:00")
         return
 
     task_id = db.add_task(
@@ -89,7 +244,6 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for t in tasks:
         deadline = datetime.fromisoformat(t["deadline"])
         hours_left = (deadline - now).total_seconds() / 3600
-
         if hours_left < 0:
             icon = "🔴"
         elif hours_left <= 2:
@@ -98,11 +252,9 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             icon = "🟡"
         else:
             icon = "🟢"
-
         lines.append(
             f"{icon} #{t['id']} | {t['assignee']} | {t['task_text']} | {deadline.strftime('%d.%m %H:%M')}"
         )
-
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -134,7 +286,6 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Запізно: {s['late']} | Прострочено: {s['overdue']}\n"
             f"   Ефективність: {rate:.0f}%\n"
         )
-
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -151,51 +302,28 @@ async def check_deadlines(application: Application):
         if 23 * 60 <= minutes_left <= 25 * 60 and not t["reminded_1d"]:
             await application.bot.send_message(
                 chat_id=chat_id,
-                text=(
-                    f"⏰ *Нагадування за 24 години*\n\n"
-                    f"*{t['assignee']}*, твоя задача:\n"
-                    f"📋 {t['task_text']}\n"
-                    f"📅 Дедлайн: {deadline_fmt}\n\n"
-                    f"Виконано? → /done {t['id']}"
-                ),
+                text=f"⏰ *Нагадування за 24 години*\n\n*{t['assignee']}*\n📋 {t['task_text']}\n📅 Дедлайн: {deadline_fmt}\n\nВиконано? → /done {t['id']}",
                 parse_mode="Markdown",
             )
             db.mark_reminded(t["id"], "reminded_1d")
-
         elif 110 <= minutes_left <= 130 and not t["reminded_2h"]:
             await application.bot.send_message(
                 chat_id=chat_id,
-                text=(
-                    f"⏰ *Нагадування за 2 години!*\n\n"
-                    f"*{t['assignee']}*\n"
-                    f"📋 {t['task_text']}\n"
-                    f"📅 Дедлайн: {deadline_fmt}"
-                ),
+                text=f"⏰ *Нагадування за 2 години!*\n\n*{t['assignee']}*\n📋 {t['task_text']}\n📅 Дедлайн: {deadline_fmt}",
                 parse_mode="Markdown",
             )
             db.mark_reminded(t["id"], "reminded_2h")
-
         elif 10 <= minutes_left <= 20 and not t["reminded_15m"]:
             await application.bot.send_message(
                 chat_id=chat_id,
-                text=(
-                    f"🚨 *15 хвилин до дедлайну!*\n\n"
-                    f"*{t['assignee']}*\n"
-                    f"📋 {t['task_text']}"
-                ),
+                text=f"🚨 *15 хвилин до дедлайну!*\n\n*{t['assignee']}*\n📋 {t['task_text']}",
                 parse_mode="Markdown",
             )
             db.mark_reminded(t["id"], "reminded_15m")
-
         elif minutes_left < 0 and not t["reminded_overdue"]:
             await application.bot.send_message(
                 chat_id=chat_id,
-                text=(
-                    f"🔴 *Прострочено!*\n\n"
-                    f"*{t['assignee']}* не виконав:\n"
-                    f"📋 {t['task_text']}\n"
-                    f"📅 Дедлайн був: {deadline_fmt}"
-                ),
+                text=f"🔴 *Прострочено!*\n\n*{t['assignee']}* не виконав:\n📋 {t['task_text']}\n📅 Дедлайн був: {deadline_fmt}",
                 parse_mode="Markdown",
             )
             db.mark_reminded(t["id"], "reminded_overdue")
@@ -204,6 +332,8 @@ async def check_deadlines(application: Application):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(CommandHandler("task", task_command))
     app.add_handler(CommandHandler("tasks", tasks_command))
     app.add_handler(CommandHandler("done", done_command))
