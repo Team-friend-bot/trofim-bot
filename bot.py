@@ -2,6 +2,7 @@ import asyncio
 import os
 import json
 import logging
+import re
 from datetime import datetime, date
 
 import anthropic
@@ -284,17 +285,36 @@ async def start_command(update, context):
 async def add_command(update, context):
     if update.message.from_user.id != OWNER_ID:
         return
-    if len(context.args) < 2:
-        await update.message.reply_text("📝 Формат: /add ім'я @username\n\nПриклад: /add Андрій @andrii_smith")
+
+    text = update.message.text or ""
+    pairs = re.findall(r"/add\s+(\S+)\s+(@?\w+)", text)
+    if not pairs:
+        await update.message.reply_text(
+            "📝 Формат: /add ім'я @username\n\nПриклад: /add Андрій @andrii_smith\n\n"
+            "Можна додати кілька — у тому ж повідомленні:\n"
+            "/add Андрій @andrii\n/add Олена @olena"
+        )
         return
-    name = context.args[0]
-    username = context.args[1].lstrip("@")
-    db.add_member(update.message.chat_id, name, username)
-    await update.message.reply_text(
-        f"✅ Додано: {name} → @{username}\n\n"
-        f"⚠️ Скажи @{username} написати /start боту @{context.bot.username} — "
-        f"інакше він не отримає задачі в особисті"
-    )
+
+    added = []
+    for name, username in pairs:
+        username = username.lstrip("@")
+        db.add_member(update.message.chat_id, name, username)
+        added.append(f"• {name} → @{username}")
+
+    bot_username = context.bot.username
+    if len(added) == 1:
+        await update.message.reply_text(
+            f"✅ Додано:\n{added[0]}\n\n"
+            f"⚠️ Скажи учаснику написати /start боту @{bot_username} — "
+            f"інакше він не отримає задачі в особисті"
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ Додано {len(added)}:\n" + "\n".join(added) +
+            f"\n\n⚠️ Кожному треба написати /start боту @{bot_username} — "
+            f"інакше задачі в особисті не приходитимуть"
+        )
 
 
 async def team_command(update, context):
