@@ -4,10 +4,21 @@ import json
 import logging
 import re
 from datetime import datetime, date
+from zoneinfo import ZoneInfo
 
 import anthropic
 import google.generativeai as genai
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+
+def now_kyiv() -> datetime:
+    return datetime.now(KYIV_TZ).replace(tzinfo=None)
+
+
+def today_kyiv() -> date:
+    return now_kyiv().date()
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler,
@@ -38,7 +49,7 @@ def parse_deadline(s: str) -> datetime:
         try:
             dt = datetime.strptime(s, fmt)
             if dt.year == 1900:
-                dt = dt.replace(year=datetime.now().year)
+                dt = dt.replace(year=now_kyiv().year)
             return dt
         except ValueError:
             continue
@@ -46,7 +57,7 @@ def parse_deadline(s: str) -> datetime:
 
 
 def parse_task_with_claude(message_text: str) -> dict:
-    today = date.today().isoformat()
+    today = today_kyiv().isoformat()
     response = claude.messages.create(
         model="claude-sonnet-4-6", max_tokens=400,
         system=f"""Ти асистент менеджера команди. Сьогодні {today}.
@@ -68,7 +79,7 @@ def parse_task_with_claude(message_text: str) -> dict:
 
 
 def parse_voice_with_gemini(audio_path: str) -> dict:
-    today = date.today().isoformat()
+    today = today_kyiv().isoformat()
     prompt = f"""Сьогодні {today}. Прослухай голос і витягни задачу. Поверни ТІЛЬКИ JSON:
 {{"has_task": true/false, "assignee": "ім'я", "task": "опис", "deadline": "YYYY-MM-DDTHH:MM:SS"}}
 Час за замовчуванням 18:00. Поточний рік {today[:4]}."""
@@ -167,7 +178,7 @@ async def close_task(context, task_id: int, by_user) -> bool:
 
     db.mark_done(task_id)
     deadline = datetime.fromisoformat(task["deadline"])
-    status = format_late(deadline, datetime.now())
+    status = format_late(deadline, now_kyiv())
 
     closer = f"@{by_user.username}" if by_user.username else by_user.first_name
 
@@ -363,7 +374,7 @@ async def tasks_command(update, context):
         await update.message.reply_text("Активних задач немає ✨")
         return
     lines = ["📋 *Активні задачі:*\n"]
-    now = datetime.now()
+    now = now_kyiv()
     for t in tasks:
         deadline = datetime.fromisoformat(t["deadline"])
         hours_left = (deadline - now).total_seconds() / 3600
@@ -474,7 +485,7 @@ async def send_overdue(application, task):
 
 async def check_deadlines(application):
     tasks = db.get_tasks_for_reminder()
-    now = datetime.now()
+    now = now_kyiv()
     for t in tasks:
         deadline = datetime.fromisoformat(t["deadline"])
         minutes_left = (deadline - now).total_seconds() / 60
