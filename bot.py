@@ -254,13 +254,31 @@ async def start_command(update, context):
     if update.message.chat.type != "private":
         return
     user = update.message.from_user
+    rows = 0
     if user.username:
-        db.update_user_id_by_username(user.username, user.id)
-    await update.message.reply_text(
-        f"Привіт, {user.first_name}! 👋\n\n"
-        f"Я бот команди TMO Trofim. Тепер ти отримуватимеш задачі від менеджера в особисті.\n\n"
-        f"Як виконаєш задачу — натискай кнопку ✅ Виконано під повідомленням."
-    )
+        rows = db.update_user_id_by_username(user.username, user.id)
+
+    if rows > 0:
+        await update.message.reply_text(
+            f"✅ Привіт, {user.first_name}!\n\n"
+            f"Тебе підключено. Тепер задачі від менеджера будуть приходити сюди в особисті.\n\n"
+            f"Як виконаєш — натискай кнопку ✅ Виконано під повідомленням."
+        )
+    else:
+        if user.username:
+            msg = (
+                f"⚠️ Привіт, {user.first_name}!\n\n"
+                f"Тебе ще не додано в команду під цим @username: @{user.username}.\n\n"
+                f"Попроси менеджера написати в групі:\n"
+                f"/add {user.first_name} @{user.username}"
+            )
+        else:
+            msg = (
+                f"⚠️ Привіт, {user.first_name}!\n\n"
+                f"У тебе не встановлено @username в Telegram. "
+                f"Встанови його в налаштуваннях (Settings → Username) і напиши /start знову."
+            )
+        await update.message.reply_text(msg)
 
 
 async def add_command(update, context):

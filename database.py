@@ -132,7 +132,8 @@ class Database:
 
     def update_user_id_by_username(self, username, user_id):
         with self._get_conn() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE members SET user_id = ? WHERE LOWER(username) = LOWER(?)",
                 (user_id, username)
             )
+            return cursor.rowcount
