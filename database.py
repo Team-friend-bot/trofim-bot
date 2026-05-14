@@ -62,6 +62,19 @@ class Database:
             rows = conn.execute("SELECT * FROM tasks WHERE is_done = 0").fetchall()
             return [dict(row) for row in rows]
 
+    def get_task(self, task_id):
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_member_by_username(self, chat_id, username):
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM members WHERE chat_id = ? AND LOWER(username) = LOWER(?)",
+                (chat_id, username.lstrip("@"))
+            ).fetchone()
+            return dict(row) if row else None
+
     def mark_done(self, task_id):
         with self._get_conn() as conn:
             conn.execute(

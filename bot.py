@@ -7,8 +7,11 @@ from datetime import datetime, date
 import anthropic
 import google.generativeai as genai
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes, MessageHandler,
+    CallbackQueryHandler, filters,
+)
 
 from database import Database
 
@@ -81,6 +84,36 @@ def parse_voice_with_gemini(audio_path: str) -> dict:
     return {"has_task": False}
 
 
+def done_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Виконано", callback_data=f"done:{task_id}")
+    ]])
+
+
+def format_late(deadline: datetime, done_at: datetime) -> str:
+    diff = done_at - deadline
+    if diff.total_seconds() <= 0:
+        return "вчасно ✅"
+    total_min = int(diff.total_seconds() / 60)
+    if total_min < 60:
+        return f"із запізненням {total_min} хв ⚠️"
+    hours = total_min // 60
+    if hours < 24:
+        return f"із запізненням на {hours} год ⚠️"
+    days = hours // 24
+    return f"із запізненням на {days} дн ⚠️"
+
+
+def assignee_user_id(task: dict) -> int | None:
+    """Try to find user_id of task's assignee."""
+    a = task["assignee"]
+    if a.startswith("@"):
+        m = db.get_member_by_username(task["chat_id"], a)
+    else:
+        m = db.get_member(task["chat_id"], a)
+    return m.get("user_id") if m else None
+
+
 async def save_and_reply(update, context, result, source=""):
     if not (result.get("has_task") and result.get("deadline") and result.get("assignee")):
         return False
@@ -100,20 +133,90 @@ async def save_and_reply(update, context, result, source=""):
 
     deadline_fmt = deadline.strftime("%d.%m.%Y %H:%M")
     suffix = f" ({source})" if source else ""
+    kb = done_keyboard(task_id)
+
     await update.message.reply_text(
-        f"✅ Задача #{task_id} зафіксована{suffix}\n👤 {tag}\n📋 {result['task']}\n📅 {deadline_fmt}"
+        f"✅ Задача #{task_id} зафіксована{suffix}\n👤 {tag}\n📋 {result['task']}\n📅 {deadline_fmt}",
+        reply_markup=kb,
     )
 
     if member and member.get("user_id"):
         try:
             await context.bot.send_message(
                 chat_id=member["user_id"],
-                text=f"📌 *Тобі поставлена задача!*\n\n📋 {result['task']}\n📅 Дедлайн: {deadline_fmt}\n\nЯк виконаєш → /done {task_id}",
+                text=(
+                    f"📌 *Тобі поставлена задача #{task_id}*\n\n"
+                    f"📋 {result['task']}\n"
+                    f"📅 Дедлайн: {deadline_fmt}\n\n"
+                    f"Коли виконаєш — натисни кнопку ⬇️"
+                ),
                 parse_mode="Markdown",
+                reply_markup=kb,
             )
         except Exception as e:
             logger.warning(f"DM failed: {e}")
     return True
+
+
+async def close_task(context, task_id: int, by_user) -> bool:
+    """Mark task done and announce in the group. Returns True if closed now."""
+    task = db.get_task(task_id)
+    if not task or task["is_done"]:
+        return False
+
+    db.mark_done(task_id)
+    deadline = datetime.fromisoformat(task["deadline"])
+    status = format_late(deadline, datetime.now())
+
+    closer = f"@{by_user.username}" if by_user.username else by_user.first_name
+
+    try:
+        await context.bot.send_message(
+            chat_id=task["chat_id"],
+            text=(
+                f"✅ {closer} закрив(ла) задачу #{task_id} {status}\n"
+                f"📋 {task['task_text']}"
+            ),
+        )
+    except Exception as e:
+        logger.error(f"Group announce failed: {e}")
+    return True
+
+
+async def done_callback(update, context):
+    query = update.callback_query
+    try:
+        task_id = int(query.data.split(":")[1])
+    except (ValueError, IndexError):
+        await query.answer()
+        return
+
+    task = db.get_task(task_id)
+    if not task:
+        await query.answer("Задача не знайдена", show_alert=True)
+        return
+    if task["is_done"]:
+        await query.answer("Задача вже виконана")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    user = query.from_user
+    user_tag = f"@{user.username}".lower() if user.username else None
+    is_owner = user.id == OWNER_ID
+    is_assignee = user_tag and task["assignee"].lower() == user_tag
+    if not (is_owner or is_assignee):
+        await query.answer("Цю задачу може закрити лише виконавець", show_alert=True)
+        return
+
+    closed = await close_task(context, task_id, user)
+    await query.answer("Задача закрита ✅" if closed else "Вже закрита")
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 async def handle_message(update, context):
@@ -154,7 +257,9 @@ async def start_command(update, context):
     if user.username:
         db.update_user_id_by_username(user.username, user.id)
     await update.message.reply_text(
-        f"Привіт, {user.first_name}! 👋\n\nЯ бот команди TMO Trofim. Тепер ти отримуватимеш задачі від менеджера в особисті."
+        f"Привіт, {user.first_name}! 👋\n\n"
+        f"Я бот команди TMO Trofim. Тепер ти отримуватимеш задачі від менеджера в особисті.\n\n"
+        f"Як виконаєш задачу — натискай кнопку ✅ Виконано під повідомленням."
     )
 
 
@@ -168,7 +273,9 @@ async def add_command(update, context):
     username = context.args[1].lstrip("@")
     db.add_member(update.message.chat_id, name, username)
     await update.message.reply_text(
-        f"✅ Додано: {name} → @{username}\n\n⚠️ Скажи @{username} написати /start боту @{context.bot.username} — інакше він не отримає задачі в особисті"
+        f"✅ Додано: {name} → @{username}\n\n"
+        f"⚠️ Скажи @{username} написати /start боту @{context.bot.username} — "
+        f"інакше він не отримає задачі в особисті"
     )
 
 
@@ -223,7 +330,9 @@ async def tasks_command(update, context):
         deadline = datetime.fromisoformat(t["deadline"])
         hours_left = (deadline - now).total_seconds() / 3600
         icon = "🔴" if hours_left < 0 else "🟠" if hours_left <= 2 else "🟡" if hours_left <= 24 else "🟢"
-        lines.append(f"{icon} #{t['id']} | {t['assignee']} | {t['task_text']} | {deadline.strftime('%d.%m %H:%M')}")
+        lines.append(
+            f"{icon} #{t['id']} | {t['assignee']} | {t['task_text']} | {deadline.strftime('%d.%m %H:%M')}"
+        )
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -236,8 +345,14 @@ async def done_command(update, context):
     except ValueError:
         await update.message.reply_text("ID має бути числом")
         return
-    db.mark_done(task_id)
-    await update.message.reply_text(f"✅ Задача #{task_id} виконана!")
+    task = db.get_task(task_id)
+    if not task:
+        await update.message.reply_text(f"❌ Задача #{task_id} не знайдена")
+        return
+    if task["is_done"]:
+        await update.message.reply_text(f"Задача #{task_id} вже виконана")
+        return
+    await close_task(context, task_id, update.message.from_user)
 
 
 async def stats_command(update, context):
@@ -248,8 +363,75 @@ async def stats_command(update, context):
     lines = ["📊 *Статистика:*\n"]
     for s in stats:
         rate = (s["on_time"] / s["total"] * 100) if s["total"] else 0
-        lines.append(f"👤 *{s['assignee']}*\n   Всього: {s['total']} | Вчасно: {s['on_time']} | Запізно: {s['late']} | Прострочено: {s['overdue']}\n   Ефективність: {rate:.0f}%\n")
+        lines.append(
+            f"👤 *{s['assignee']}*\n"
+            f"   Всього: {s['total']} | Вчасно: {s['on_time']} | "
+            f"Запізно: {s['late']} | Прострочено: {s['overdue']}\n"
+            f"   Ефективність: {rate:.0f}%\n"
+        )
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def send_reminder(application, task, when_text: str, urgent: bool):
+    """Send reminder to group + personal DM. Skips if task already done."""
+    fresh = db.get_task(task["id"])
+    if not fresh or fresh["is_done"]:
+        return
+
+    deadline = datetime.fromisoformat(task["deadline"])
+    deadline_fmt = deadline.strftime("%d.%m %H:%M")
+    icon = "🚨" if urgent else "⏰"
+
+    group_text = (
+        f"{icon} *{when_text}*\n"
+        f"❗ Не виконано: {task['assignee']}\n"
+        f"📋 #{task['id']} {task['task_text']}\n"
+        f"📅 Дедлайн: {deadline_fmt}"
+    )
+    kb = done_keyboard(task["id"])
+    try:
+        await application.bot.send_message(
+            chat_id=task["chat_id"], text=group_text,
+            parse_mode="Markdown", reply_markup=kb,
+        )
+    except Exception as e:
+        logger.error(f"Group reminder failed: {e}")
+
+    uid = assignee_user_id(task)
+    if uid:
+        try:
+            await application.bot.send_message(
+                chat_id=uid,
+                text=(
+                    f"{icon} *{when_text}*\n\n"
+                    f"📋 Задача #{task['id']}: {task['task_text']}\n"
+                    f"📅 Дедлайн: {deadline_fmt}\n\n"
+                    f"Натисни кнопку коли виконаєш ⬇️"
+                ),
+                parse_mode="Markdown", reply_markup=kb,
+            )
+        except Exception as e:
+            logger.warning(f"DM reminder failed: {e}")
+
+
+async def send_overdue(application, task):
+    fresh = db.get_task(task["id"])
+    if not fresh or fresh["is_done"]:
+        return
+    deadline = datetime.fromisoformat(task["deadline"])
+    text = (
+        f"🔴 *ПРОСТРОЧЕНО!*\n"
+        f"❗ Не виконав: {task['assignee']}\n"
+        f"📋 #{task['id']} {task['task_text']}\n"
+        f"📅 Дедлайн був: {deadline.strftime('%d.%m %H:%M')}"
+    )
+    try:
+        await application.bot.send_message(
+            chat_id=task["chat_id"], text=text,
+            parse_mode="Markdown", reply_markup=done_keyboard(task["id"]),
+        )
+    except Exception as e:
+        logger.error(f"Overdue announce failed: {e}")
 
 
 async def check_deadlines(application):
@@ -258,18 +440,17 @@ async def check_deadlines(application):
     for t in tasks:
         deadline = datetime.fromisoformat(t["deadline"])
         minutes_left = (deadline - now).total_seconds() / 60
-        deadline_fmt = deadline.strftime("%d.%m.%Y %H:%M")
         if 23 * 60 <= minutes_left <= 25 * 60 and not t["reminded_1d"]:
-            await application.bot.send_message(chat_id=t["chat_id"], text=f"⏰ *Нагадування за 24 години*\n\n{t['assignee']}\n📋 {t['task_text']}\n📅 {deadline_fmt}", parse_mode="Markdown")
+            await send_reminder(application, t, "Залишилось 24 години", urgent=False)
             db.mark_reminded(t["id"], "reminded_1d")
         elif 110 <= minutes_left <= 130 and not t["reminded_2h"]:
-            await application.bot.send_message(chat_id=t["chat_id"], text=f"⏰ *За 2 години!*\n\n{t['assignee']}\n📋 {t['task_text']}", parse_mode="Markdown")
+            await send_reminder(application, t, "Залишилось 2 години", urgent=True)
             db.mark_reminded(t["id"], "reminded_2h")
         elif 10 <= minutes_left <= 20 and not t["reminded_15m"]:
-            await application.bot.send_message(chat_id=t["chat_id"], text=f"🚨 *15 хвилин!*\n\n{t['assignee']}\n📋 {t['task_text']}", parse_mode="Markdown")
+            await send_reminder(application, t, "Залишилось 15 хвилин", urgent=True)
             db.mark_reminded(t["id"], "reminded_15m")
         elif minutes_left < 0 and not t["reminded_overdue"]:
-            await application.bot.send_message(chat_id=t["chat_id"], text=f"🔴 *Прострочено!*\n\n{t['assignee']}\n📋 {t['task_text']}\n📅 {deadline_fmt}", parse_mode="Markdown")
+            await send_overdue(application, t)
             db.mark_reminded(t["id"], "reminded_overdue")
 
 
@@ -285,6 +466,7 @@ def main():
     app.add_handler(CommandHandler("tasks", tasks_command))
     app.add_handler(CommandHandler("done", done_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CallbackQueryHandler(done_callback, pattern=r"^done:\d+$"))
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_deadlines, "interval", minutes=5, args=[app])
     scheduler.start()
