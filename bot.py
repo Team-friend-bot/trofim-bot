@@ -4,13 +4,17 @@ import json
 import logging
 import re
 from datetime import datetime, date
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import anthropic
 import google.generativeai as genai
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-KYIV_TZ = ZoneInfo("Europe/Kyiv")
+try:
+    KYIV_TZ = ZoneInfo("Europe/Kyiv")
+except ZoneInfoNotFoundError:
+    from datetime import timezone, timedelta
+    KYIV_TZ = timezone(timedelta(hours=3))  # EEST fallback
 
 
 def now_kyiv() -> datetime:
