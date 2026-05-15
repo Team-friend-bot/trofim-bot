@@ -1,10 +1,14 @@
+import os
 import sqlite3
 from typing import List, Dict
 
 
 class Database:
-    def __init__(self, db_path: str = "tasks.db"):
-        self.db_path = db_path
+    def __init__(self, db_path: str = None):
+        self.db_path = db_path or os.environ.get("DATABASE_PATH", "tasks.db")
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
         self._init_db()
 
     def _get_conn(self):
