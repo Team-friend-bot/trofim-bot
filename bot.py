@@ -507,8 +507,21 @@ async def check_deadlines(application):
             db.mark_reminded(t["id"], "reminded_overdue")
 
 
+async def error_handler(update, context):
+    err = context.error
+    logger.error(f"Update caused error: {err}", exc_info=err)
+    try:
+        msg = f"⚠️ Помилка бота:\n{type(err).__name__}: {err}"
+        if update and getattr(update, "effective_message", None):
+            msg += f"\n\nПовідомлення: {update.effective_message.text or '(не текст)'}"
+        await context.bot.send_message(chat_id=OWNER_ID, text=msg[:4000])
+    except Exception as e:
+        logger.error(f"Could not notify owner: {e}")
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+    app.add_error_handler(error_handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(CommandHandler("start", start_command))
