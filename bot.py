@@ -83,20 +83,36 @@ def parse_task_with_claude(message_text: str) -> dict:
 
 
 def parse_voice_with_gemini(audio_path: str) -> dict:
+    import time
     today = today_kyiv().isoformat()
     prompt = f"""Сьогодні {today}. Прослухай голос і витягни задачу. Поверни ТІЛЬКИ JSON:
 {{"has_task": true/false, "assignee": "ім'я", "task": "опис", "deadline": "YYYY-MM-DDTHH:MM:SS"}}
 Час за замовчуванням 18:00. Поточний рік {today[:4]}."""
-    audio_file = genai.upload_file(audio_path, mime_type="audio/ogg")
-    response = gemini_model.generate_content([prompt, audio_file])
-    raw = response.text
-    logger.info(f"Gemini raw: {raw}")
-    try:
-        s, e = raw.find("{"), raw.rfind("}")
-        if s >= 0 and e > s:
-            return json.loads(raw[s:e+1])
-    except Exception as ex:
-        logger.error(f"Gemini parse error: {ex}")
+
+    last_err = None
+    for attempt in range(3):
+        try:
+            audio_file = genai.upload_file(audio_path, mime_type="audio/ogg")
+            response = gemini_model.generate_content([prompt, audio_file])
+            raw = response.text
+            logger.info(f"Gemini raw: {raw}")
+            try:
+                s, e = raw.find("{"), raw.rfind("}")
+                if s >= 0 and e > s:
+                    return json.loads(raw[s:e+1])
+            except Exception as ex:
+                logger.error(f"Gemini parse error: {ex}")
+            return {"has_task": False}
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            transient = "503" in msg or "500" in msg or "429" in msg or "Service Unavailable" in msg or "overloaded" in msg.lower()
+            logger.warning(f"Gemini attempt {attempt + 1} failed: {e}")
+            if not transient or attempt == 2:
+                raise
+            time.sleep(2 * (attempt + 1))
+    if last_err:
+        raise last_err
     return {"has_task": False}
 
 
@@ -260,7 +276,18 @@ async def handle_voice(update, context):
             await update.message.reply_text("🎤 Не вдалось розпізнати. Назви ім'я і дедлайн чіткіше.")
     except Exception as e:
         logger.error(f"Voice error: {e}")
-        await update.message.reply_text(f"❌ Помилка: {e}")
+        msg = str(e)
+        if "503" in msg or "Service Unavailable" in msg or "overloaded" in msg.lower():
+            await update.message.reply_text(
+                "⚠️ Гугл тимчасово недоступний (розпізнавання голосу).\n"
+                "Спробуй ще раз через хвилину або напиши задачу текстом."
+            )
+        elif "429" in msg:
+            await update.message.reply_text(
+                "⚠️ Перевищено ліміт запитів до Гугла. Спробуй за 5 хвилин."
+            )
+        else:
+            await update.message.reply_text(f"❌ Помилка обробки голосу: {type(e).__name__}")
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
