@@ -44,7 +44,7 @@ logger.info(f"Bot starting. OWNER_ID={OWNER_ID}")
 db = Database()
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+gemini_model = genai.GenerativeModel("gemini-2.0-flash")
 
 
 def parse_deadline(s: str) -> datetime:
