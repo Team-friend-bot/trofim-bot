@@ -295,7 +295,7 @@ async def handle_voice(update, context):
             await update.message.reply_text("🎤 Не вдалось розпізнати. Назви ім'я і дедлайн чіткіше.")
     except Exception as e:
         logger.error(f"Voice error: {e}")
-        await update.message.reply_text(f"❌ Помилка обробки голосу: {type(e).__name__}")
+        await update.message.reply_text(f"❌ Помилка голосу: {type(e).__name__}: {str(e)[:200]}")
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
