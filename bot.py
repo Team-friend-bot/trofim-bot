@@ -84,10 +84,15 @@ def parse_voice_with_claude(audio_path: str) -> dict:
     today = today_kyiv().isoformat()
 
     mp3_path = audio_path.replace(".ogg", ".mp3")
-    subprocess.run(
-        ["ffmpeg", "-i", audio_path, "-q:a", "4", mp3_path, "-y"],
-        capture_output=True, check=True, timeout=30,
-    )
+    try:
+        subprocess.run(
+            ["ffmpeg", "-i", audio_path, "-q:a", "4", mp3_path, "-y"],
+            capture_output=True, check=True, timeout=30,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg_not_installed")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"ffmpeg_error: {e.stderr.decode()[:200]}")
 
     with open(mp3_path, "rb") as f:
         audio_data = base64.standard_b64encode(f.read()).decode("utf-8")
