@@ -80,9 +80,20 @@ def parse_task_with_claude(message_text: str) -> dict:
 
 
 def parse_voice_with_claude(audio_path: str) -> dict:
+    import subprocess
     today = today_kyiv().isoformat()
-    with open(audio_path, "rb") as f:
+
+    mp3_path = audio_path.replace(".ogg", ".mp3")
+    subprocess.run(
+        ["ffmpeg", "-i", audio_path, "-q:a", "4", mp3_path, "-y"],
+        capture_output=True, check=True, timeout=30,
+    )
+
+    with open(mp3_path, "rb") as f:
         audio_data = base64.standard_b64encode(f.read()).decode("utf-8")
+    if os.path.exists(mp3_path):
+        os.remove(mp3_path)
+
     response = claude.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=400,
@@ -93,7 +104,7 @@ def parse_voice_with_claude(audio_path: str) -> dict:
                     "type": "audio",
                     "source": {
                         "type": "base64",
-                        "media_type": "audio/ogg",
+                        "media_type": "audio/mpeg",
                         "data": audio_data,
                     },
                 },
