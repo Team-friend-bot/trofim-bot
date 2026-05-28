@@ -6,8 +6,8 @@ import re
 from datetime import datetime, date
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import base64
 import anthropic
-import google.generativeai as genai
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 try:
@@ -36,15 +36,12 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 OWNER_ID = int(os.environ["OWNER_ID"])
 
 logger.info(f"Bot starting. OWNER_ID={OWNER_ID}")
 
 db = Database()
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-2.0-flash")
 
 
 def parse_deadline(s: str) -> datetime:
@@ -82,37 +79,43 @@ def parse_task_with_claude(message_text: str) -> dict:
     return {"has_task": False}
 
 
-def parse_voice_with_gemini(audio_path: str) -> dict:
-    import time
+def parse_voice_with_claude(audio_path: str) -> dict:
     today = today_kyiv().isoformat()
-    prompt = f"""Сьогодні {today}. Прослухай голос і витягни задачу. Поверни ТІЛЬКИ JSON:
-{{"has_task": true/false, "assignee": "ім'я", "task": "опис", "deadline": "YYYY-MM-DDTHH:MM:SS"}}
-Час за замовчуванням 18:00. Поточний рік {today[:4]}."""
-
-    last_err = None
-    for attempt in range(3):
-        try:
-            audio_file = genai.upload_file(audio_path, mime_type="audio/ogg")
-            response = gemini_model.generate_content([prompt, audio_file])
-            raw = response.text
-            logger.info(f"Gemini raw: {raw}")
-            try:
-                s, e = raw.find("{"), raw.rfind("}")
-                if s >= 0 and e > s:
-                    return json.loads(raw[s:e+1])
-            except Exception as ex:
-                logger.error(f"Gemini parse error: {ex}")
-            return {"has_task": False}
-        except Exception as e:
-            last_err = e
-            msg = str(e)
-            transient = "503" in msg or "500" in msg or "429" in msg or "Service Unavailable" in msg or "overloaded" in msg.lower()
-            logger.warning(f"Gemini attempt {attempt + 1} failed: {e}")
-            if not transient or attempt == 2:
-                raise
-            time.sleep(2 * (attempt + 1))
-    if last_err:
-        raise last_err
+    with open(audio_path, "rb") as f:
+        audio_data = base64.standard_b64encode(f.read()).decode("utf-8")
+    response = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=400,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "audio",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "audio/ogg",
+                        "data": audio_data,
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        f"Сьогодні {today}. Прослухай голос і витягни задачу. Поверни ТІЛЬКИ JSON:\n"
+                        f'{{\"has_task\": true/false, \"assignee\": \"ім\'я або null\", \"task\": \"опис або null\", \"deadline\": \"YYYY-MM-DDTHH:MM:SS або null\"}}\n'
+                        f"Час за замовчуванням 18:00. has_task: false якщо немає імені або дати. Поточний рік {today[:4]}."
+                    ),
+                },
+            ],
+        }],
+    )
+    raw = response.content[0].text
+    logger.info(f"Claude audio raw: {raw}")
+    try:
+        s, e = raw.find("{"), raw.rfind("}")
+        if s >= 0 and e > s:
+            return json.loads(raw[s:e+1])
+    except Exception as ex:
+        logger.error(f"Claude audio parse error: {ex}")
     return {"has_task": False}
 
 
@@ -270,24 +273,13 @@ async def handle_voice(update, context):
     try:
         file = await context.bot.get_file(voice.file_id)
         await file.download_to_drive(audio_path)
-        result = await asyncio.to_thread(parse_voice_with_gemini, audio_path)
+        result = await asyncio.to_thread(parse_voice_with_claude, audio_path)
         saved = await save_and_reply(update, context, result, source="з голосу")
         if not saved:
             await update.message.reply_text("🎤 Не вдалось розпізнати. Назви ім'я і дедлайн чіткіше.")
     except Exception as e:
         logger.error(f"Voice error: {e}")
-        msg = str(e)
-        if "503" in msg or "Service Unavailable" in msg or "overloaded" in msg.lower():
-            await update.message.reply_text(
-                "⚠️ Гугл тимчасово недоступний (розпізнавання голосу).\n"
-                "Спробуй ще раз через хвилину або напиши задачу текстом."
-            )
-        elif "429" in msg:
-            await update.message.reply_text(
-                "⚠️ Перевищено ліміт запитів до Гугла. Спробуй за 5 хвилин."
-            )
-        else:
-            await update.message.reply_text(f"❌ Помилка обробки голосу: {type(e).__name__}")
+        await update.message.reply_text(f"❌ Помилка обробки голосу: {type(e).__name__}")
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
