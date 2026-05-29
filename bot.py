@@ -6,7 +6,6 @@ import re
 from datetime import datetime, date
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import base64
 import anthropic
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -79,14 +78,14 @@ def parse_task_with_claude(message_text: str) -> dict:
     return {"has_task": False}
 
 
-def parse_voice_with_claude(audio_path: str) -> dict:
+def parse_voice(audio_path: str) -> dict:
     import subprocess
-    today = today_kyiv().isoformat()
+    import speech_recognition as sr
 
-    mp3_path = audio_path.replace(".ogg", ".mp3")
+    wav_path = audio_path.replace(".ogg", ".wav")
     try:
         subprocess.run(
-            ["ffmpeg", "-i", audio_path, "-q:a", "4", mp3_path, "-y"],
+            ["ffmpeg", "-i", audio_path, "-ar", "16000", "-ac", "1", wav_path, "-y"],
             capture_output=True, check=True, timeout=30,
         )
     except FileNotFoundError:
@@ -94,45 +93,19 @@ def parse_voice_with_claude(audio_path: str) -> dict:
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"ffmpeg_error: {e.stderr.decode()[:200]}")
 
-    with open(mp3_path, "rb") as f:
-        audio_data = base64.standard_b64encode(f.read()).decode("utf-8")
-    if os.path.exists(mp3_path):
-        os.remove(mp3_path)
-
-    response = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=400,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "audio",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "audio/mpeg",
-                        "data": audio_data,
-                    },
-                },
-                {
-                    "type": "text",
-                    "text": (
-                        f"Сьогодні {today}. Прослухай голос і витягни задачу. Поверни ТІЛЬКИ JSON:\n"
-                        f'{{\"has_task\": true/false, \"assignee\": \"ім\'я або null\", \"task\": \"опис або null\", \"deadline\": \"YYYY-MM-DDTHH:MM:SS або null\"}}\n'
-                        f"Час за замовчуванням 18:00. has_task: false якщо немає імені або дати. Поточний рік {today[:4]}."
-                    ),
-                },
-            ],
-        }],
-    )
-    raw = response.content[0].text
-    logger.info(f"Claude audio raw: {raw}")
+    recognizer = sr.Recognizer()
     try:
-        s, e = raw.find("{"), raw.rfind("}")
-        if s >= 0 and e > s:
-            return json.loads(raw[s:e+1])
-    except Exception as ex:
-        logger.error(f"Claude audio parse error: {ex}")
-    return {"has_task": False}
+        with sr.AudioFile(wav_path) as source:
+            audio = recognizer.record(source)
+        text = recognizer.recognize_google(audio, language="uk-UA")
+    except sr.UnknownValueError:
+        return {"has_task": False}
+    finally:
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
+
+    logger.info(f"Voice transcription: {text}")
+    return parse_task_with_claude(text)
 
 
 def done_keyboard(task_id: int) -> InlineKeyboardMarkup:
@@ -289,7 +262,7 @@ async def handle_voice(update, context):
     try:
         file = await context.bot.get_file(voice.file_id)
         await file.download_to_drive(audio_path)
-        result = await asyncio.to_thread(parse_voice_with_claude, audio_path)
+        result = await asyncio.to_thread(parse_voice, audio_path)
         saved = await save_and_reply(update, context, result, source="з голосу")
         if not saved:
             await update.message.reply_text("🎤 Не вдалось розпізнати. Назви ім'я і дедлайн чіткіше.")
