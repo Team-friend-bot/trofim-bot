@@ -41,9 +41,15 @@ class Database:
                     name TEXT NOT NULL,
                     username TEXT,
                     user_id INTEGER,
+                    is_manager INTEGER DEFAULT 0,
                     PRIMARY KEY (chat_id, name)
                 )
             """)
+            # Migration: add is_manager to existing DB if column missing
+            try:
+                conn.execute("ALTER TABLE members ADD COLUMN is_manager INTEGER DEFAULT 0")
+            except Exception:
+                pass
 
     def add_task(self, chat_id, task_text, assignee, deadline, created_by):
         with self._get_conn() as conn:
@@ -79,6 +85,14 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
+    def get_member_by_user_id(self, chat_id, user_id):
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM members WHERE chat_id = ? AND user_id = ?",
+                (chat_id, user_id)
+            ).fetchone()
+            return dict(row) if row else None
+
     def mark_done(self, task_id):
         with self._get_conn() as conn:
             conn.execute(
@@ -93,7 +107,7 @@ class Database:
     def get_stats(self, chat_id):
         with self._get_conn() as conn:
             rows = conn.execute("""
-                SELECT 
+                SELECT
                     assignee,
                     COUNT(*) as total,
                     SUM(CASE WHEN is_done = 1 THEN 1 ELSE 0 END) as done,
@@ -132,6 +146,13 @@ class Database:
             conn.execute(
                 "DELETE FROM members WHERE chat_id = ? AND LOWER(name) = LOWER(?)",
                 (chat_id, name)
+            )
+
+    def set_manager(self, chat_id, name, is_manager: bool):
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE members SET is_manager = ? WHERE chat_id = ? AND LOWER(name) = LOWER(?)",
+                (1 if is_manager else 0, chat_id, name)
             )
 
     def update_user_id_by_username(self, username, user_id):

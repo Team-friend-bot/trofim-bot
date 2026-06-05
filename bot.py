@@ -243,10 +243,18 @@ async def done_callback(update, context):
         pass
 
 
+def is_allowed_to_assign(chat_id: int, user_id: int) -> bool:
+    """Owner or any member with is_manager=1 can assign tasks."""
+    if user_id == OWNER_ID:
+        return True
+    member = db.get_member_by_user_id(chat_id, user_id)
+    return bool(member and member.get("is_manager"))
+
+
 async def handle_message(update, context):
     if not update.message or not update.message.text:
         return
-    if update.message.from_user.id != OWNER_ID:
+    if not is_allowed_to_assign(update.message.chat_id, update.message.from_user.id):
         return
     result = await asyncio.to_thread(parse_task_with_claude, update.message.text)
     await save_and_reply(update, context, result)
@@ -255,7 +263,7 @@ async def handle_message(update, context):
 async def handle_voice(update, context):
     if not update.message or not update.message.voice:
         return
-    if update.message.from_user.id != OWNER_ID:
+    if not is_allowed_to_assign(update.message.chat_id, update.message.from_user.id):
         return
     voice = update.message.voice
     audio_path = f"/tmp/{voice.file_id}.ogg"
@@ -347,10 +355,38 @@ async def team_command(update, context):
         return
     lines = ["👥 *Команда:*\n"]
     for m in members:
-        icon = "✅" if m.get("user_id") else "⚠️"
-        lines.append(f"{icon} {m['name']} → @{m['username']}")
-    lines.append("\n✅ — отримує задачі в особисті\n⚠️ — ще не написав /start боту")
+        connected = "✅" if m.get("user_id") else "⚠️"
+        role = " 👔 менеджер" if m.get("is_manager") else ""
+        lines.append(f"{connected} {m['name']} → @{m['username']}{role}")
+    lines.append("\n✅ — підключений  ⚠️ — ще не написав /start\n👔 — може ставити задачі")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def manager_command(update, context):
+    """Grant or revoke manager role. Usage: /manager ім'я  or  /manager ім'я remove"""
+    if update.message.from_user.id != OWNER_ID:
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "📝 Призначити менеджера: /manager ім'я\n"
+            "❌ Зняти роль: /manager ім'я remove\n\n"
+            "Менеджер може ставити задачі голосом і текстом так само як ти."
+        )
+        return
+    name = context.args[0]
+    revoke = len(context.args) > 1 and context.args[1].lower() == "remove"
+    member = db.get_member(update.message.chat_id, name)
+    if not member:
+        await update.message.reply_text(f"❌ {name} не знайдений в команді. Спочатку /add {name} @username")
+        return
+    db.set_manager(update.message.chat_id, name, not revoke)
+    if revoke:
+        await update.message.reply_text(f"✅ {name} більше не менеджер")
+    else:
+        await update.message.reply_text(
+            f"✅ {name} тепер менеджер — може ставити задачі голосом і текстом.\n\n"
+            f"⚠️ Якщо ще не підключений — хай напише /start боту @{context.bot.username}"
+        )
 
 
 async def remove_command(update, context):
@@ -535,6 +571,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("add", add_command))
     app.add_handler(CommandHandler("team", team_command))
+    app.add_handler(CommandHandler("manager", manager_command))
     app.add_handler(CommandHandler("remove", remove_command))
     app.add_handler(CommandHandler("task", task_command))
     app.add_handler(CommandHandler("tasks", tasks_command))
