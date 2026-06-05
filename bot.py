@@ -271,9 +271,7 @@ async def handle_voice(update, context):
         file = await context.bot.get_file(voice.file_id)
         await file.download_to_drive(audio_path)
         result = await asyncio.to_thread(parse_voice, audio_path)
-        saved = await save_and_reply(update, context, result, source="з голосу")
-        if not saved:
-            await update.message.reply_text("🎤 Не вдалось розпізнати. Назви ім'я і дедлайн чіткіше.")
+        await save_and_reply(update, context, result, source="з голосу")
     except Exception as e:
         logger.error(f"Voice error: {e}")
         await update.message.reply_text(f"❌ Помилка голосу: {type(e).__name__}: {str(e)[:200]}")
