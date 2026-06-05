@@ -251,6 +251,17 @@ async def done_callback(update, context):
         pass
 
 
+async def is_chat_admin(bot, chat_id: int, user_id: int) -> bool:
+    """Check if user is a Telegram group admin or creator."""
+    if user_id == OWNER_ID:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in ("creator", "administrator")
+    except Exception:
+        return False
+
+
 def is_allowed_to_assign(chat_id: int, user_id: int) -> bool:
     """Owner or any member with is_manager=1 can assign tasks."""
     if user_id == OWNER_ID:
@@ -320,7 +331,7 @@ async def start_command(update, context):
 
 
 async def add_command(update, context):
-    if update.message.from_user.id != OWNER_ID:
+    if not await is_chat_admin(context.bot, update.message.chat_id, update.message.from_user.id):
         return
 
     text = update.message.text or ""
@@ -370,7 +381,7 @@ async def team_command(update, context):
 
 async def manager_command(update, context):
     """Grant or revoke manager role. Usage: /manager ім'я  or  /manager ім'я remove"""
-    if update.message.from_user.id != OWNER_ID:
+    if not await is_chat_admin(context.bot, update.message.chat_id, update.message.from_user.id):
         return
     if not context.args:
         await update.message.reply_text(
@@ -396,7 +407,7 @@ async def manager_command(update, context):
 
 
 async def remove_command(update, context):
-    if update.message.from_user.id != OWNER_ID:
+    if not await is_chat_admin(context.bot, update.message.chat_id, update.message.from_user.id):
         return
     if not context.args:
         await update.message.reply_text("Формат: /remove ім'я")
@@ -406,7 +417,7 @@ async def remove_command(update, context):
 
 
 async def task_command(update, context):
-    if update.message.from_user.id != OWNER_ID:
+    if not await is_chat_admin(context.bot, update.message.chat_id, update.message.from_user.id):
         return
     parts = [p.strip() for p in " ".join(context.args).split("|")]
     if len(parts) != 3:
