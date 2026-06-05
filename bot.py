@@ -57,14 +57,22 @@ def parse_deadline(s: str) -> datetime:
 
 
 def parse_task_with_claude(message_text: str) -> dict:
-    today = today_kyiv().isoformat()
+    now = now_kyiv()
+    now_str = now.strftime("%Y-%m-%dT%H:%M:%S")
+    today = now.date().isoformat()
     response = claude.messages.create(
         model="claude-sonnet-4-6", max_tokens=400,
-        system=f"""Ти асистент менеджера команди. Сьогодні {today}.
-Розпізнавай делегування задач. Поверни ТІЛЬКИ JSON:
+        system=f"""Ти асистент менеджера команди. Зараз {now_str} (Київський час).
+Розпізнавай делегування задач — будь-якою мовою (укр, рос, англ).
+Поверни ТІЛЬКИ JSON:
 {{"has_task": true/false, "assignee": "ім'я або null", "task": "опис або null", "deadline": "YYYY-MM-DDTHH:MM:SS або null"}}
-Час за замовчуванням 18:00. has_task: false якщо немає імені АБО дати.
-"Андрій підготуй звіт до 20 травня" → {{"has_task": true, "assignee": "Андрій", "task": "підготувати звіт", "deadline": "{today[:4]}-05-20T18:00:00"}}""",
+Правила дедлайну:
+- Абсолютний: "до 20 травня" → {today[:4]}-05-20T18:00:00
+- Відносний: "через 15 хвилин" / "в течение 15 минут" → додай до поточного часу {now_str}
+- "за годину" / "через час" → +1 година від {now_str}
+- "протягом дня" / "сьогодні" → {today}T18:00:00
+- Якщо час не вказано — 18:00
+has_task: false якщо немає імені АБО немає часу/дедлайну.""",
         messages=[{"role": "user", "content": message_text}],
     )
     raw = response.content[0].text
