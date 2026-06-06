@@ -239,7 +239,9 @@ async def done_callback(update, context):
     user_tag = f"@{user.username}".lower() if user.username else None
     is_owner = user.id == OWNER_ID
     is_assignee = user_tag and task["assignee"].lower() == user_tag
-    if not (is_owner or is_assignee):
+    is_admin = await is_chat_admin(context.bot, task["chat_id"], user.id)
+    is_manager = is_allowed_to_assign(task["chat_id"], user.id)
+    if not (is_owner or is_assignee or is_admin or is_manager):
         await query.answer("Цю задачу може закрити лише виконавець", show_alert=True)
         return
 
