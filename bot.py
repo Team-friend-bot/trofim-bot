@@ -56,34 +56,36 @@ def parse_deadline(s: str) -> datetime:
     raise ValueError(f"Cannot parse: {s}")
 
 
-def parse_task_with_claude(message_text: str) -> dict:
+def parse_task_with_claude(message_text: str) -> list[dict]:
     now = now_kyiv()
     now_str = now.strftime("%Y-%m-%dT%H:%M:%S")
     today = now.date().isoformat()
     response = claude.messages.create(
-        model="claude-sonnet-4-6", max_tokens=400,
+        model="claude-sonnet-4-6", max_tokens=600,
         system=f"""Ти асистент менеджера команди. Зараз {now_str} (Київський час).
 Розпізнавай делегування задач — будь-якою мовою (укр, рос, англ).
-Поверни ТІЛЬКИ JSON:
-{{"has_task": true/false, "assignee": "ім'я або null", "task": "опис або null", "deadline": "YYYY-MM-DDTHH:MM:SS або null"}}
+Якщо є кілька виконавців — створи окремий об'єкт для кожного.
+Поверни ТІЛЬКИ JSON-масив:
+[{{"has_task": true/false, "assignee": "ім'я або @username", "task": "опис", "deadline": "YYYY-MM-DDTHH:MM:SS"}}]
 Правила дедлайну:
-- Абсолютний: "до 20 травня" → {today[:4]}-05-20T18:00:00
-- Відносний: "через 15 хвилин" / "в течение 15 минут" → додай до поточного часу {now_str}
-- "за годину" / "через час" → +1 година від {now_str}
-- "протягом дня" / "сьогодні" → {today}T18:00:00
+- "до 20 травня" → {today[:4]}-05-20T18:00:00
+- "завтра до 10:00" → наступний день від {now_str} о 10:00
+- "через 15 хвилин" / "в течение 15 минут" → {now_str} + 15 хв
+- "за годину" / "через час" → {now_str} + 1 год
+- "сьогодні" / "протягом дня" → {today}T18:00:00
 - Якщо час не вказано — 18:00
-has_task: false якщо немає імені АБО немає часу/дедлайну.""",
+has_task: false якщо немає імені АБО немає дедлайну.""",
         messages=[{"role": "user", "content": message_text}],
     )
     raw = response.content[0].text
     logger.info(f"Claude raw: {raw}")
     try:
-        s, e = raw.find("{"), raw.rfind("}")
+        s, e = raw.find("["), raw.rfind("]")
         if s >= 0 and e > s:
             return json.loads(raw[s:e+1])
     except Exception as ex:
         logger.error(f"Parse error: {ex}")
-    return {"has_task": False}
+    return [{"has_task": False}]
 
 
 def parse_voice(audio_path: str) -> dict:
@@ -113,7 +115,7 @@ def parse_voice(audio_path: str) -> dict:
             os.remove(wav_path)
 
     logger.info(f"Voice transcription: {text}")
-    return parse_task_with_claude(text)
+    return parse_task_with_claude(text)  # returns list[dict]
 
 
 def done_keyboard(task_id: int) -> InlineKeyboardMarkup:
@@ -277,8 +279,9 @@ async def handle_message(update, context):
         return
     if not is_allowed_to_assign(update.message.chat_id, update.message.from_user.id):
         return
-    result = await asyncio.to_thread(parse_task_with_claude, update.message.text)
-    await save_and_reply(update, context, result)
+    results = await asyncio.to_thread(parse_task_with_claude, update.message.text)
+    for result in results:
+        await save_and_reply(update, context, result)
 
 
 async def handle_voice(update, context):
@@ -291,8 +294,9 @@ async def handle_voice(update, context):
     try:
         file = await context.bot.get_file(voice.file_id)
         await file.download_to_drive(audio_path)
-        result = await asyncio.to_thread(parse_voice, audio_path)
-        await save_and_reply(update, context, result, source="з голосу")
+        results = await asyncio.to_thread(parse_voice, audio_path)
+        for result in results:
+            await save_and_reply(update, context, result, source="з голосу")
     except Exception as e:
         logger.error(f"Voice error: {e}")
         await update.message.reply_text(f"❌ Помилка голосу: {type(e).__name__}: {str(e)[:200]}")
