@@ -109,7 +109,7 @@ def parse_voice(audio_path: str) -> dict:
             audio = recognizer.record(source)
         text = recognizer.recognize_google(audio, language="uk-UA")
     except sr.UnknownValueError:
-        return {"has_task": False}
+        return [{"has_task": False}]
     finally:
         if os.path.exists(wav_path):
             os.remove(wav_path)
