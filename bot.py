@@ -115,7 +115,7 @@ def parse_voice(audio_path: str, chat_id: int = None) -> list[dict]:
     try:
         with sr.AudioFile(wav_path) as source:
             audio = recognizer.record(source)
-        text = recognizer.recognize_google(audio, language="uk-UA")
+        text = recognizer.recognize_google(audio, language="uk-UA", request_timeout=60)
     except sr.UnknownValueError:
         return [{"has_task": False}]
     finally:
@@ -595,7 +595,14 @@ async def error_handler(update, context):
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .read_timeout(120)
+        .write_timeout(120)
+        .connect_timeout(30)
+        .build()
+    )
     app.add_error_handler(error_handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
