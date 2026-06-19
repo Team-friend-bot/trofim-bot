@@ -115,7 +115,7 @@ def parse_voice(audio_path: str, chat_id: int = None) -> list[dict]:
     try:
         with sr.AudioFile(wav_path) as source:
             audio = recognizer.record(source)
-        text = recognizer.recognize_google(audio, language="uk-UA", request_timeout=60)
+        text = recognizer.recognize_google(audio, language="uk-UA")
     except sr.UnknownValueError:
         return [{"has_task": False}]
     finally:
