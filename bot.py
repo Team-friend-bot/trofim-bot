@@ -57,6 +57,7 @@ def parse_deadline(s: str) -> datetime:
 
 
 def parse_task_with_claude(message_text: str, chat_id: int = None) -> list[dict]:
+    import time
     now = now_kyiv()
     now_str = now.strftime("%Y-%m-%dT%H:%M:%S")
     today = now.date().isoformat()
@@ -66,11 +67,13 @@ def parse_task_with_claude(message_text: str, chat_id: int = None) -> list[dict]
         members = db.get_team(chat_id)
         if members:
             names = ", ".join(f"{m['name']} (@{m['username']})" for m in members)
-            team_hint = f"\nСписок команди: {names}\nЯкщо в повідомленні скорочення або прізвисько — підбери найближче ім'я з команди (Віка→Вікторія, Льоша→Олексій тощо). Для assignee використовуй @username з команди."
+            team_hint = (
+                f"\nСписок команди: {names}\n"
+                f"Якщо в повідомленні скорочення або прізвисько — підбери найближче ім'я з команди "
+                f"(Віка→Вікторія, Льоша→Олексій тощо). Для assignee використовуй @username з команди."
+            )
 
-    response = claude.messages.create(
-        model="claude-sonnet-4-6", max_tokens=600,
-        system=f"""Ти асистент менеджера команди. Зараз {now_str} (Київський час).
+    system_prompt = f"""Ти асистент менеджера команди. Зараз {now_str} (Київський час).
 Розпізнавай делегування задач — будь-якою мовою (укр, рос, англ).
 Якщо є кілька виконавців — створи окремий об'єкт для кожного.{team_hint}
 Поверни ТІЛЬКИ JSON-масив:
@@ -82,17 +85,31 @@ def parse_task_with_claude(message_text: str, chat_id: int = None) -> list[dict]
 - "за годину" / "через час" → {now_str} + 1 год
 - "сьогодні" / "протягом дня" → {today}T18:00:00
 - Якщо час не вказано — 18:00
-has_task: false якщо немає імені АБО немає дедлайну.""",
-        messages=[{"role": "user", "content": message_text}],
-    )
-    raw = response.content[0].text
-    logger.info(f"Claude raw: {raw}")
-    try:
-        s, e = raw.find("["), raw.rfind("]")
-        if s >= 0 and e > s:
-            return json.loads(raw[s:e+1])
-    except Exception as ex:
-        logger.error(f"Parse error: {ex}")
+has_task: false якщо немає імені АБО немає дедлайну."""
+
+    for attempt in range(3):
+        try:
+            response = claude.messages.create(
+                model="claude-sonnet-4-6", max_tokens=600,
+                system=system_prompt,
+                messages=[{"role": "user", "content": message_text}],
+            )
+            raw = response.content[0].text
+            logger.info(f"Claude raw: {raw}")
+            try:
+                s, e = raw.find("["), raw.rfind("]")
+                if s >= 0 and e > s:
+                    return json.loads(raw[s:e+1])
+            except Exception as ex:
+                logger.error(f"Parse error: {ex}")
+            return [{"has_task": False}]
+        except Exception as e:
+            msg = str(e)
+            if ("529" in msg or "overloaded" in msg.lower() or "529" in msg) and attempt < 2:
+                logger.warning(f"Claude overloaded, retry {attempt + 1}")
+                time.sleep(3 * (attempt + 1))
+                continue
+            raise
     return [{"has_task": False}]
 
 
