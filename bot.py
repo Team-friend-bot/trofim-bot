@@ -695,6 +695,10 @@ async def error_handler(update, context):
 
 
 def main():
+    if os.environ.get("RAILWAY_ENVIRONMENT"):
+        logger.warning("Running on Railway — bot moved to the VPS deployment, exiting to avoid a polling conflict.")
+        return
+
     app = (
         Application.builder()
         .token(BOT_TOKEN)
