@@ -182,8 +182,12 @@ async def save_and_reply(update, context, result, source=""):
         return False
 
     chat_id = update.message.chat_id
-    member = db.get_member(chat_id, result["assignee"])
-    tag = f"@{member['username']}" if member and member.get("username") else result["assignee"]
+    raw_assignee = result["assignee"]
+    if raw_assignee.startswith("@"):
+        member = db.get_member_by_username(chat_id, raw_assignee)
+    else:
+        member = db.get_member(chat_id, raw_assignee)
+    tag = f"@{member['username']}" if member and member.get("username") else raw_assignee
 
     task_id = db.add_task(
         chat_id=chat_id, task_text=result["task"], assignee=tag,
@@ -265,7 +269,7 @@ async def done_callback(update, context):
     user = query.from_user
     user_tag = f"@{user.username}".lower() if user.username else None
     is_owner = user.id == OWNER_ID
-    is_assignee = user_tag and task["assignee"].lower() == user_tag
+    is_assignee = (user_tag and task["assignee"].lower() == user_tag) or (assignee_user_id(task) == user.id)
     is_admin = await is_chat_admin(context.bot, task["chat_id"], user.id)
     is_manager = is_allowed_to_assign(task["chat_id"], user.id)
     if not (is_owner or is_assignee or is_admin or is_manager):
