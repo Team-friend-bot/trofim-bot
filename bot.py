@@ -743,7 +743,10 @@ def main():
     scheduler.add_job(check_deadlines, "interval", minutes=5, args=[app])
     scheduler.start()
     logger.info("trofim_bot started")
-    app.run_polling(drop_pending_updates=True)
+    # Explicitly request ALL update types — Telegram otherwise remembers the last
+    # allowed_updates (was ["message"]), which silently dropped callback_query and
+    # broke every inline button (Виконано / snooze).
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
