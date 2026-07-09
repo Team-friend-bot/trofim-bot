@@ -3,7 +3,7 @@ import os
 import json
 import logging
 import re
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import anthropic
@@ -12,7 +12,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 try:
     KYIV_TZ = ZoneInfo("Europe/Kyiv")
 except ZoneInfoNotFoundError:
-    from datetime import timezone, timedelta
+    from datetime import timezone
     KYIV_TZ = timezone(timedelta(hours=3))  # EEST fallback
 
 
@@ -143,10 +143,19 @@ def parse_voice(audio_path: str, chat_id: int = None) -> list[dict]:
     return parse_task_with_claude(text, chat_id)  # returns list[dict]
 
 
+SNOOZE_OPTIONS = {"1h": timedelta(hours=1), "3h": timedelta(hours=3), "1d": timedelta(days=1)}
+SNOOZE_LABELS = {"1h": "1 годину", "3h": "3 години", "1d": "1 день"}
+
+
 def done_keyboard(task_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Виконано", callback_data=f"done:{task_id}")
-    ]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Виконано", callback_data=f"done:{task_id}")],
+        [
+            InlineKeyboardButton("⏰ +1 год", callback_data=f"snooze:{task_id}:1h"),
+            InlineKeyboardButton("+3 год", callback_data=f"snooze:{task_id}:3h"),
+            InlineKeyboardButton("+1 день", callback_data=f"snooze:{task_id}:1d"),
+        ],
+    ])
 
 
 def format_late(deadline: datetime, done_at: datetime) -> str:
@@ -246,6 +255,16 @@ async def close_task(context, task_id: int, by_user) -> bool:
     return True
 
 
+async def can_act_on_task(context, task: dict, user) -> bool:
+    """Owner, the assignee themselves, a group admin, or a flagged manager can act on a task."""
+    user_tag = f"@{user.username}".lower() if user.username else None
+    is_owner = user.id == OWNER_ID
+    is_assignee = (user_tag and task["assignee"].lower() == user_tag) or (assignee_user_id(task) == user.id)
+    is_admin = await is_chat_admin(context.bot, task["chat_id"], user.id)
+    is_manager = is_allowed_to_assign(task["chat_id"], user.id)
+    return is_owner or is_assignee or is_admin or is_manager
+
+
 async def done_callback(update, context):
     query = update.callback_query
     try:
@@ -267,12 +286,7 @@ async def done_callback(update, context):
         return
 
     user = query.from_user
-    user_tag = f"@{user.username}".lower() if user.username else None
-    is_owner = user.id == OWNER_ID
-    is_assignee = (user_tag and task["assignee"].lower() == user_tag) or (assignee_user_id(task) == user.id)
-    is_admin = await is_chat_admin(context.bot, task["chat_id"], user.id)
-    is_manager = is_allowed_to_assign(task["chat_id"], user.id)
-    if not (is_owner or is_assignee or is_admin or is_manager):
+    if not await can_act_on_task(context, task, user):
         await query.answer("Цю задачу може закрити лише виконавець", show_alert=True)
         return
 
@@ -280,6 +294,71 @@ async def done_callback(update, context):
     await query.answer("Задача закрита ✅" if closed else "Вже закрита")
     try:
         await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+async def snooze_callback(update, context):
+    query = update.callback_query
+    try:
+        _, task_id_str, code = query.data.split(":")
+        task_id = int(task_id_str)
+    except (ValueError, IndexError):
+        await query.answer()
+        return
+    delta = SNOOZE_OPTIONS.get(code)
+    if delta is None:
+        await query.answer()
+        return
+
+    task = db.get_task(task_id)
+    if not task:
+        await query.answer("Задача не знайдена", show_alert=True)
+        return
+    if task["is_done"]:
+        await query.answer("Задача вже виконана")
+        return
+
+    user = query.from_user
+    if not await can_act_on_task(context, task, user):
+        await query.answer("Перенести дедлайн може лише виконавець", show_alert=True)
+        return
+
+    new_deadline = now_kyiv() + delta
+    db.update_deadline(task_id, new_deadline.isoformat())
+    deadline_fmt = new_deadline.strftime("%d.%m.%Y %H:%M")
+    label = SNOOZE_LABELS[code]
+    who = f"@{user.username}" if user.username else user.first_name
+
+    await query.answer(f"Перенесено на {label}")
+    kb = done_keyboard(task_id)
+    text = (
+        f"⏰ {who} переніс(ла) дедлайн задачі #{task_id} на {label}\n"
+        f"📋 {task['task_text']}\n"
+        f"📅 Новий дедлайн: {deadline_fmt}"
+    )
+    try:
+        await context.bot.send_message(chat_id=task["chat_id"], text=text, reply_markup=kb)
+    except Exception as e:
+        logger.error(f"Group snooze announce failed: {e}")
+
+    uid = assignee_user_id(task)
+    if uid and uid != user.id:
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=(
+                    f"⏰ Дедлайн задачі #{task_id} перенесено на {label}\n\n"
+                    f"📋 {task['task_text']}\n"
+                    f"📅 Новий дедлайн: {deadline_fmt}"
+                ),
+                reply_markup=kb,
+            )
+        except Exception as e:
+            logger.warning(f"DM snooze notify failed: {e}")
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=kb)
     except Exception:
         pass
 
@@ -637,6 +716,7 @@ def main():
     app.add_handler(CommandHandler("done", done_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CallbackQueryHandler(done_callback, pattern=r"^done:\d+$"))
+    app.add_handler(CallbackQueryHandler(snooze_callback, pattern=r"^snooze:\d+:(1h|3h|1d)$"))
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_deadlines, "interval", minutes=5, args=[app])
     scheduler.start()

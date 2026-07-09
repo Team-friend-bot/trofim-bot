@@ -100,6 +100,14 @@ class Database:
                 (task_id,)
             )
 
+    def update_deadline(self, task_id, new_deadline):
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE tasks SET deadline = ?, reminded_1d = 0, reminded_2h = 0, "
+                "reminded_15m = 0, reminded_overdue = 0 WHERE id = ?",
+                (new_deadline, task_id)
+            )
+
     def mark_reminded(self, task_id, field):
         with self._get_conn() as conn:
             conn.execute(f"UPDATE tasks SET {field} = 1 WHERE id = ?", (task_id,))
