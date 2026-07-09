@@ -76,7 +76,9 @@ def parse_task_with_claude(message_text: str, chat_id: int = None) -> list[dict]
     system_prompt = f"""Ти асистент менеджера команди. Зараз {now_str} (Київський час).
 Розпізнавай делегування задач — будь-якою мовою (укр, рос, англ).
 Якщо є кілька виконавців — створи окремий об'єкт для кожного.{team_hint}
-Поверни ТІЛЬКИ JSON-масив:
+Текст може бути з голосового і містити помилки розпізнавання — виправляй очевидні
+(«обери мене»→«набери мене», «по боту»→«по борту») і все одно став задачу.
+Відповідай ТІЛЬКИ валідним JSON-масивом, БЕЗ ```-обгорток і БЕЗ коментарів:
 [{{"has_task": true/false, "assignee": "@username з команди або ім'я", "task": "опис", "deadline": "YYYY-MM-DDTHH:MM:SS"}}]
 Правила дедлайну:
 - "до 20 травня" → {today[:4]}-05-20T18:00:00
@@ -85,7 +87,9 @@ def parse_task_with_claude(message_text: str, chat_id: int = None) -> list[dict]
 - "за годину" / "через час" → {now_str} + 1 год
 - "сьогодні" / "протягом дня" → {today}T18:00:00
 - Якщо час не вказано — 18:00
-has_task: false якщо немає імені АБО немає дедлайну."""
+ГОЛОВНЕ ПРАВИЛО has_task: якщо є виконавець (ім'я/@username) І будь-який дедлайн —
+has_task ЗАВЖДИ true, навіть якщо формулювання задачі неідеальне. Не суди про «зрозумілість».
+has_task: false ТІЛЬКИ якщо реально немає виконавця АБО немає дедлайну."""
 
     for attempt in range(3):
         try:
@@ -113,7 +117,8 @@ has_task: false якщо немає імені АБО немає дедлайн�
     return [{"has_task": False}]
 
 
-def parse_voice(audio_path: str, chat_id: int = None) -> list[dict]:
+def parse_voice(audio_path: str, chat_id: int = None) -> tuple[str, list[dict]]:
+    """Returns (transcription, parsed_tasks). transcription is "" if unrecognizable."""
     import subprocess
     import speech_recognition as sr
 
@@ -134,13 +139,13 @@ def parse_voice(audio_path: str, chat_id: int = None) -> list[dict]:
             audio = recognizer.record(source)
         text = recognizer.recognize_google(audio, language="uk-UA")
     except sr.UnknownValueError:
-        return [{"has_task": False}]
+        return "", [{"has_task": False}]
     finally:
         if os.path.exists(wav_path):
             os.remove(wav_path)
 
     logger.info(f"Voice transcription: {text}")
-    return parse_task_with_claude(text, chat_id)  # returns list[dict]
+    return text, parse_task_with_claude(text, chat_id)
 
 
 SNOOZE_OPTIONS = {"1h": timedelta(hours=1), "3h": timedelta(hours=3), "1d": timedelta(days=1)}
@@ -402,9 +407,22 @@ async def handle_voice(update, context):
     try:
         file = await context.bot.get_file(voice.file_id)
         await file.download_to_drive(audio_path)
-        results = await asyncio.to_thread(parse_voice, audio_path, update.message.chat_id)
+        transcription, results = await asyncio.to_thread(parse_voice, audio_path, update.message.chat_id)
+        any_saved = False
         for result in results:
-            await save_and_reply(update, context, result, source="з голосу")
+            if await save_and_reply(update, context, result, source="з голосу"):
+                any_saved = True
+        if not any_saved:
+            if not transcription:
+                await update.message.reply_text(
+                    "🎙 Не вдалося розібрати голосове. Спробуй сказати чіткіше або напиши текстом."
+                )
+            else:
+                await update.message.reply_text(
+                    f"🎙 Почув: «{transcription}»\n\n"
+                    f"⚠️ Не зміг поставити задачу — вкажи виконавця і дедлайн "
+                    f"(напр. «Максим, зроби звіт до завтра 10:00»)."
+                )
     except Exception as e:
         logger.error(f"Voice error: {e}")
         await update.message.reply_text(f"❌ Помилка голосу: {type(e).__name__}: {str(e)[:200]}")
