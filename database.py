@@ -50,6 +50,12 @@ class Database:
                 conn.execute("ALTER TABLE members ADD COLUMN is_manager INTEGER DEFAULT 0")
             except Exception:
                 pass
+            # Migration: `started` = user pressed Start in a private chat (DM reachable).
+            # Distinct from user_id, which is also filled by passive group tracking.
+            try:
+                conn.execute("ALTER TABLE members ADD COLUMN started INTEGER DEFAULT 0")
+            except Exception:
+                pass
 
     def add_task(self, chat_id, task_text, assignee, deadline, created_by):
         with self._get_conn() as conn:
@@ -188,9 +194,24 @@ class Database:
                 )
 
     def update_user_id_by_username(self, username, user_id):
+        """Called on private /start — marks the member as DM-reachable (started=1)."""
         with self._get_conn() as conn:
             cursor = conn.execute(
-                "UPDATE members SET user_id = ? WHERE LOWER(username) = LOWER(?)",
+                "UPDATE members SET user_id = ?, started = 1 WHERE LOWER(username) = LOWER(?)",
                 (user_id, username)
             )
             return cursor.rowcount
+
+    def get_unconnected(self, chat_id):
+        """Members who haven't pressed Start privately yet (no DM possible)."""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM members WHERE chat_id = ? AND COALESCE(started, 0) = 0 ORDER BY name",
+                (chat_id,)
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_chat_ids(self):
+        with self._get_conn() as conn:
+            rows = conn.execute("SELECT DISTINCT chat_id FROM members").fetchall()
+            return [r["chat_id"] for r in rows]

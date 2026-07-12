@@ -519,7 +519,7 @@ async def team_command(update, context):
         return
     lines = ["👥 *Команда:*\n"]
     for m in members:
-        connected = "✅" if m.get("user_id") else "⚠️"
+        connected = "✅" if m.get("started") else "⚠️"
         role = " 👔 менеджер" if m.get("is_manager") else ""
         lines.append(f"{connected} {m['name']} → @{m['username']}{role}")
     lines.append("\n✅ — підключений  ⚠️ — ще не написав /start\n👔 — може ставити задачі")
@@ -715,6 +715,30 @@ async def check_deadlines(application):
             db.mark_reminded(t["id"], "reminded_overdue")
 
 
+async def connect_digest(application):
+    """Once a day, DM the owner the list of members who haven't pressed Start yet."""
+    pending = []
+    for chat_id in db.get_chat_ids():
+        pending.extend(db.get_unconnected(chat_id))
+    if not pending:
+        return  # everyone connected — stay silent
+
+    lines = ["⚠️ *Ще не підключили особисті* (не натиснули Start):\n"]
+    for m in pending:
+        uname = f"@{m['username']}" if m.get("username") else m["name"]
+        lines.append(f"• {m['name']} — {uname}")
+    lines.append(
+        "\nПопроси їх відкрити @TMO_team_bot і натиснути *Start* — "
+        "тоді задачі й нагадування йтимуть їм в особисті. У групі все працює й без цього."
+    )
+    try:
+        await application.bot.send_message(
+            chat_id=OWNER_ID, text="\n".join(lines), parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"connect_digest failed: {e}")
+
+
 async def error_handler(update, context):
     err = context.error
     logger.error(f"Update caused error: {err}", exc_info=err)
@@ -757,8 +781,9 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CallbackQueryHandler(done_callback, pattern=r"^done:\d+$"))
     app.add_handler(CallbackQueryHandler(snooze_callback, pattern=r"^snooze:\d+:(1h|3h|1d)$"))
-    scheduler = AsyncIOScheduler()
+    scheduler = AsyncIOScheduler(timezone=KYIV_TZ)
     scheduler.add_job(check_deadlines, "interval", minutes=5, args=[app])
+    scheduler.add_job(connect_digest, "cron", hour=9, minute=0, args=[app])
     scheduler.start()
     logger.info("trofim_bot started")
     # Explicitly request ALL update types — Telegram otherwise remembers the last
