@@ -163,6 +163,30 @@ class Database:
                 (1 if is_manager else 0, chat_id, name)
             )
 
+    def upsert_seen_member(self, chat_id, username, user_id, first_name):
+        """Passively register anyone who talks in the group.
+        Matches existing rows by username (updates their user_id without touching
+        name/is_manager); otherwise adds a new member keyed by first_name.
+        Skips users without a username (can't be tagged or DMed reliably)."""
+        if not username:
+            return
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT name FROM members WHERE chat_id = ? AND LOWER(username) = LOWER(?)",
+                (chat_id, username)
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "UPDATE members SET user_id = ? WHERE chat_id = ? AND LOWER(username) = LOWER(?)",
+                    (user_id, chat_id, username)
+                )
+            else:
+                conn.execute(
+                    "INSERT OR IGNORE INTO members (chat_id, name, username, user_id, is_manager) "
+                    "VALUES (?, ?, ?, ?, 0)",
+                    (chat_id, first_name or username, username, user_id)
+                )
+
     def update_user_id_by_username(self, username, user_id):
         with self._get_conn() as conn:
             cursor = conn.execute(

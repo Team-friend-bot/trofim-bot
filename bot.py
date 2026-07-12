@@ -387,6 +387,21 @@ def is_allowed_to_assign(chat_id: int, user_id: int) -> bool:
     return bool(member and member.get("is_manager"))
 
 
+async def track_member(update, context):
+    """Passively learn the roster: register every group member who sends anything."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not msg or not chat or not user or user.is_bot:
+        return
+    if chat.type not in ("group", "supergroup"):
+        return
+    try:
+        db.upsert_seen_member(chat.id, user.username, user.id, user.first_name)
+    except Exception as e:
+        logger.warning(f"track_member failed: {e}")
+
+
 async def handle_message(update, context):
     if not update.message or not update.message.text:
         return
@@ -726,6 +741,9 @@ def main():
         .build()
     )
     app.add_error_handler(error_handler)
+    # group=1 runs independently of the task handlers below — learns the roster
+    # from every message so the team list rebuilds itself passively.
+    app.add_handler(MessageHandler(filters.ALL, track_member), group=1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(CommandHandler("start", start_command))
