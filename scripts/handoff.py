@@ -27,11 +27,16 @@ from datetime import datetime, timezone
 
 HANDOFF_REF = "claude-handoff"
 PAYLOAD_FILE = "handoff.enc"
+PREV_PAYLOAD_FILE = "handoff.prev.enc"
+# не висеть на мёртвой сети: обрыв, если меньше 1 КБ/с дольше 20 секунд
+SLOW_NET = ["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=20"]
 MAGIC = b"TROFIM-HANDOFF-v1"
 KDF_ITERS = 200_000
 
 MAX_DIGEST_CHARS = 40_000
 MAX_PATCH_CHARS = 200_000
+MAX_NEW_FILE_CHARS = 64_000
+MAX_NEW_FILES_CHARS = 256_000
 MAX_TOOL_OUTPUT = 400
 MAX_ASSISTANT_TEXT = 2_000
 MAX_USER_TEXT = 4_000
@@ -47,9 +52,13 @@ def log(msg):
 
 
 def run(args, cwd=None, input_bytes=None, check=True):
+    kw = {}
+    if input_bytes is None:
+        # без этого git может зависнуть насмерть, спрашивая пароль в фоне
+        kw["stdin"] = subprocess.DEVNULL
     p = subprocess.run(
         args, cwd=cwd, input=input_bytes,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw
     )
     if check and p.returncode != 0:
         raise RuntimeError(
@@ -400,70 +409,113 @@ def collect_git_state(root):
         "stat": git_out(["diff", "HEAD", "--stat"], root),
         "untracked": [],
     }
-    for line in state["status"].splitlines():
-        if line.startswith("?? "):
-            state["untracked"].append(line[3:])
     patch = git_out(["diff", "HEAD", "--binary"], root)
     if len(patch) > MAX_PATCH_CHARS:
         patch = ""
         state["patch_skipped"] = "патч слишком большой, не переносится"
     state["patch"] = redact(patch) if patch else ""
+
+    # новые файлы git diff не видит — переносим их содержимым,
+    # иначе на второй машине не хватало бы ровно того, что начали писать
+    state["new_files"] = {}
+    budget = MAX_NEW_FILES_CHARS
+    listing = git_out(["ls-files", "--others", "--exclude-standard"], root)
+    for rel in listing.splitlines():
+        rel = rel.strip()
+        if not rel or not _safe_relpath(rel):
+            continue
+        state["untracked"].append(rel)
+        full = os.path.join(root, rel)
+        try:
+            if os.path.getsize(full) > MAX_NEW_FILE_CHARS:
+                state.setdefault("new_files_skipped", []).append(f"{rel} (слишком большой)")
+                continue
+            with open(full, "rb") as fh:
+                raw = fh.read()
+            if b"\0" in raw:
+                state.setdefault("new_files_skipped", []).append(f"{rel} (двоичный)")
+                continue
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            state.setdefault("new_files_skipped", []).append(f"{rel} (не прочитался)")
+            continue
+        if len(text) > budget:
+            state.setdefault("new_files_skipped", []).append(f"{rel} (не хватило места)")
+            continue
+        budget -= len(text)
+        state["new_files"][rel] = redact(text)
     return state
+
+
+def _safe_relpath(rel):
+    """Путь должен оставаться внутри проекта — файлы из переноса пишутся на диск."""
+    if os.path.isabs(rel) or rel.startswith("~"):
+        return False
+    parts = rel.replace("\\", "/").split("/")
+    return ".." not in parts and ".git" not in parts
 
 
 # --------------------------------------------------------------------------
 # транспорт: одна ветка с одним коммитом без истории
 # --------------------------------------------------------------------------
 
-def push_payload(root, content_bytes, note):
-    blob = git(["hash-object", "-w", "--stdin"], root, input_bytes=content_bytes)
-    sha = blob.stdout.decode().strip()
+def push_payload(root, content_bytes, note, prev_bytes=None):
+    def blob_of(data):
+        return git(["hash-object", "-w", "--stdin"], root, input_bytes=data).stdout.decode().strip()
+
+    sha = blob_of(content_bytes)
     readme = (
         "Служебная ветка Claude Code: перенос незаконченных сессий между машинами.\n"
-        "Содержимое зашифровано (AES-эквивалент на HMAC-SHA256, ключ HANDOFF_KEY).\n"
+        "Содержимое зашифровано (PBKDF2 + HMAC-SHA256, ключ HANDOFF_KEY).\n"
+        f"{PAYLOAD_FILE} — последний перенос, handoff.prev.enc — предыдущий.\n"
         "Не мержить в main. Пересоздаётся целиком при каждом сохранении.\n"
     ).encode("utf-8")
-    readme_sha = git(["hash-object", "-w", "--stdin"], root, input_bytes=readme).stdout.decode().strip()
 
-    tree_input = (
-        f"100644 blob {readme_sha}\tREADME.md\n"
-        f"100644 blob {sha}\t{PAYLOAD_FILE}\n"
-    ).encode("utf-8")
+    entries = [
+        f"100644 blob {blob_of(readme)}\tREADME.md",
+        f"100644 blob {sha}\t{PAYLOAD_FILE}",
+    ]
+    if prev_bytes:
+        # предыдущий перенос не пропадает: если его ещё не успели применить,
+        # его можно достать через `handoff.py load --prev`
+        entries.append(f"100644 blob {blob_of(prev_bytes)}\t{PREV_PAYLOAD_FILE}")
+    tree_input = ("\n".join(sorted(entries)) + "\n").encode("utf-8")
     tree = git(["mktree"], root, input_bytes=tree_input).stdout.decode().strip()
 
     env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
     env.setdefault("GIT_AUTHOR_NAME", "claude-handoff")
     env.setdefault("GIT_AUTHOR_EMAIL", "claude-handoff@local")
     env.setdefault("GIT_COMMITTER_NAME", "claude-handoff")
     env.setdefault("GIT_COMMITTER_EMAIL", "claude-handoff@local")
     p = subprocess.run(
-        ["git", "commit-tree", tree, "-m", note],
-        cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        ["git", "commit-tree", tree, "-m", note], cwd=root, env=env,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     if p.returncode != 0:
         raise RuntimeError(p.stderr.decode("utf-8", "replace"))
     commit = p.stdout.decode().strip()
 
     last_err = None
-    for attempt, delay in enumerate((0, 2, 4, 8)):
+    for delay in (0, 2, 4, 8):
         if delay:
             time.sleep(delay)
-        push = git(["push", "--force", "origin", f"{commit}:refs/heads/{HANDOFF_REF}"], root, check=False)
+        push = git(
+            SLOW_NET + ["push", "--force", "origin", f"{commit}:refs/heads/{HANDOFF_REF}"],
+            root, check=False,
+        )
         if push.returncode == 0:
             return commit
         last_err = push.stderr.decode("utf-8", "replace").strip()
     raise RuntimeError(f"push не прошёл: {last_err}")
 
 
-def fetch_payload(root):
-    fetched = git(
-        ["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=15",
-         "fetch", "--depth=1", "--quiet", "origin", HANDOFF_REF],
-        root, check=False,
-    )
+def fetch_payload(root, which=PAYLOAD_FILE):
+    fetched = git(SLOW_NET + ["fetch", "--depth=1", "--quiet", "origin", HANDOFF_REF],
+                  root, check=False)
     if fetched.returncode != 0:
         return None
-    show = git(["show", f"FETCH_HEAD:{PAYLOAD_FILE}"], root, check=False)
+    show = git(["show", f"FETCH_HEAD:{which}"], root, check=False)
     if show.returncode != 0:
         return None
     return show.stdout
@@ -528,15 +580,19 @@ def cmd_save(args):
 
     blob = encrypt(key, raw)
     where = "телефон/веб" if payload["remote"] else "локальная машина"
-    commit = push_payload(root, blob, f"handoff {payload['saved_at']} ({where})")
+    prev = fetch_payload(root)
+    commit = push_payload(root, blob, f"handoff {payload['saved_at']} ({where})", prev_bytes=prev)
     if not args.quiet:
         log(f"сессия сохранена в ветку {HANDOFF_REF} ({commit[:8]}, {len(blob)} байт)")
     return 0
 
 
-def load_payload(root):
-    blob = fetch_payload(root)
+def load_payload(root, prev=False):
+    which = PREV_PAYLOAD_FILE if prev else PAYLOAD_FILE
+    blob = fetch_payload(root, which)
     if blob is None:
+        if prev:
+            return None, "предыдущего переноса нет"
         return None, "нет ветки claude-handoff (ещё ничего не сохраняли)"
     key = load_key()
     if not key:
@@ -587,18 +643,23 @@ def render_for_context(payload, current_session=None):
         lines.append("```")
         lines.append(gitstate["stat"])
         lines.append("```")
-        if gitstate.get("patch"):
-            lines.append(
-                "\nПатч перенесён. Чтобы наложить его в текущее дерево:\n"
-                "`python3 scripts/handoff.py patch --apply`\n"
-                "(без флага — только показать)."
-            )
+    new_files = gitstate.get("new_files") or {}
+    if new_files:
+        lines.append("\n### Новые файлы (ещё не в git), перенесены целиком\n")
+        for path in list(new_files)[:25]:
+            lines.append(f"- `{path}`")
+    if gitstate.get("patch") or new_files:
+        lines.append(
+            "\nЧтобы получить эту работу в текущее дерево:\n"
+            "`python3 scripts/handoff.py patch --apply`\n"
+            "(без флага — только показать; существующие файлы не перезаписываются)."
+        )
     if gitstate.get("patch_skipped"):
         lines.append(f"\n⚠️ {gitstate['patch_skipped']}")
-    if gitstate.get("untracked"):
+    if gitstate.get("new_files_skipped"):
         lines.append(
-            "\n⚠️ На той машине есть неотслеживаемые файлы, они **не** переносятся: "
-            + ", ".join(f"`{f}`" for f in gitstate["untracked"][:10])
+            "\n⚠️ Не перенеслись: "
+            + ", ".join(f"`{f}`" for f in gitstate["new_files_skipped"][:10])
         )
 
     lines.append("\n### Ход диалога (хвост)\n")
@@ -614,7 +675,7 @@ def render_for_context(payload, current_session=None):
 
 def cmd_load(args):
     root = project_root()
-    payload, err = load_payload(root)
+    payload, err = load_payload(root, prev=args.prev)
     if err:
         log(err)
         return 1
@@ -628,28 +689,55 @@ def cmd_load(args):
 
 def cmd_patch(args):
     root = project_root()
-    payload, err = load_payload(root)
+    payload, err = load_payload(root, prev=args.prev)
     if err:
         log(err)
         return 1
-    patch = (payload.get("git") or {}).get("patch") or ""
-    if not patch.strip():
-        log("в переносе нет патча (на той машине всё было закоммичено)")
+    gitstate = payload.get("git") or {}
+    patch = gitstate.get("patch") or ""
+    new_files = gitstate.get("new_files") or {}
+    if not patch.strip() and not new_files:
+        log("в переносе нет незакоммиченной работы (на той машине всё было закоммичено)")
         return 1
+
     if not args.apply:
-        print(patch)
+        if patch.strip():
+            print(patch)
+        for path, text in new_files.items():
+            print(f"\n=== новый файл: {path} ===\n{text}")
         return 0
-    data = patch.encode("utf-8")
-    if not data.endswith(b"\n"):
-        data += b"\n"
-    check = git(["apply", "--check", "-"], root, input_bytes=data, check=False)
-    if check.returncode != 0:
-        log("патч не накладывается на текущее дерево:")
-        log(check.stderr.decode("utf-8", "replace").strip())
-        log("посмотреть глазами: python3 scripts/handoff.py patch")
-        return 1
-    git(["apply", "-"], root, input_bytes=data)
-    log("патч наложен в рабочее дерево")
+
+    if patch.strip():
+        data = patch.encode("utf-8")
+        if not data.endswith(b"\n"):
+            data += b"\n"
+        check = git(["apply", "--check", "-"], root, input_bytes=data, check=False)
+        if check.returncode != 0:
+            log("патч не накладывается на текущее дерево:")
+            log(check.stderr.decode("utf-8", "replace").strip())
+            log("посмотреть глазами: python3 scripts/handoff.py patch")
+            return 1
+        git(["apply", "-"], root, input_bytes=data)
+        log("патч наложен в рабочее дерево")
+
+    written, skipped = [], []
+    for rel, text in new_files.items():
+        if not _safe_relpath(rel):
+            skipped.append(f"{rel} (подозрительный путь)")
+            continue
+        full = os.path.join(root, rel)
+        if os.path.exists(full):
+            # ничего чужого не перезаписываем — это данные с другой машины
+            skipped.append(f"{rel} (уже существует, не тронут)")
+            continue
+        os.makedirs(os.path.dirname(full) or root, exist_ok=True)
+        with open(full, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        written.append(rel)
+    if written:
+        log("новые файлы созданы: " + ", ".join(written))
+    if skipped:
+        log("пропущены: " + ", ".join(skipped))
     return 0
 
 
@@ -733,10 +821,12 @@ def cmd_hook_stop(args):
         cmd = [sys.executable, os.path.abspath(__file__), "save", "--quiet"]
         if data.get("transcript_path"):
             cmd += ["--transcript", data["transcript_path"]]
+        logfile = os.path.join(root, ".claude", "handoff", "autosave.log")
+        if os.path.exists(logfile) and os.path.getsize(logfile) > 1_000_000:
+            os.replace(logfile, logfile + ".1")
         subprocess.Popen(
-            cmd, cwd=root, stdout=subprocess.DEVNULL,
-            stderr=open(os.path.join(root, ".claude", "handoff", "autosave.log"), "ab"),
-            start_new_session=True,
+            cmd, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=open(logfile, "ab"), start_new_session=True,
         )
     except Exception as exc:  # noqa: BLE001
         hook_log(root, f"stop-хук пропущен: {exc}")
@@ -759,10 +849,12 @@ def main():
 
     p = sub.add_parser("load", help="показать сохранённый перенос")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--prev", action="store_true", help="предыдущий перенос, а не последний")
     p.set_defaults(func=cmd_load)
 
-    p = sub.add_parser("patch", help="показать/наложить патч незакоммиченных правок")
+    p = sub.add_parser("patch", help="показать/наложить незакоммиченную работу")
     p.add_argument("--apply", action="store_true")
+    p.add_argument("--prev", action="store_true", help="из предыдущего переноса")
     p.set_defaults(func=cmd_patch)
 
     p = sub.add_parser("clear", help="очистить перенос")
@@ -774,8 +866,20 @@ def main():
     p = sub.add_parser("hook-stop")
     p.set_defaults(func=cmd_hook_stop)
 
+    # ни один git-вызов не должен требовать ввода с клавиатуры:
+    # в фоновом автосохранении это означало бы вечно висящий процесс
+    os.environ["GIT_TERMINAL_PROMPT"] = "0"
+
     args = ap.parse_args()
-    return args.func(args)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:  # noqa: BLE001
+        # внятная строка вместо traceback: это может писаться в фоновый лог
+        text = str(exc).strip()
+        log(f"не удалось: {text.splitlines()[0] if text else exc!r}")
+        return 1
 
 
 if __name__ == "__main__":
