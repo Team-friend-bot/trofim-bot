@@ -3,32 +3,19 @@ import os
 import json
 import logging
 import re
-from datetime import datetime, date, timedelta
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from datetime import datetime, timedelta
 
 import anthropic
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-try:
-    KYIV_TZ = ZoneInfo("Europe/Kyiv")
-except ZoneInfoNotFoundError:
-    from datetime import timezone
-    KYIV_TZ = timezone(timedelta(hours=3))  # EEST fallback
-
-
-def now_kyiv() -> datetime:
-    return datetime.now(KYIV_TZ).replace(tzinfo=None)
-
-
-def today_kyiv() -> date:
-    return now_kyiv().date()
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler,
     CallbackQueryHandler, filters,
 )
 
-from database import Database
+# Time helpers live in database.py so storage and formatting cannot drift apart:
+# everything is naive Kyiv local time.
+from database import Database, KYIV_TZ, now_kyiv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
