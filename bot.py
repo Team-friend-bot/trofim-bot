@@ -206,6 +206,7 @@ async def save_and_reply(update, context, result, source=""):
     task_id = db.add_task(
         chat_id=chat_id, task_text=result["task"], assignee=tag,
         deadline=deadline.isoformat(), created_by=update.message.from_user.first_name,
+        created_at=now_kyiv().isoformat(),
     )
 
     deadline_fmt = deadline.strftime("%d.%m.%Y %H:%M")
@@ -241,9 +242,10 @@ async def close_task(context, task_id: int, by_user) -> bool:
     if not task or task["is_done"]:
         return False
 
-    db.mark_done(task_id)
+    done_at = now_kyiv()
+    db.mark_done(task_id, done_at.isoformat())
     deadline = datetime.fromisoformat(task["deadline"])
-    status = format_late(deadline, now_kyiv())
+    status = format_late(deadline, done_at)
 
     closer = f"@{by_user.username}" if by_user.username else by_user.first_name
 
@@ -564,7 +566,9 @@ async def remove_command(update, context):
 
 
 async def task_command(update, context):
-    if not await is_chat_admin(context.bot, update.message.chat_id, update.message.from_user.id):
+    user = update.message.from_user
+    if not (is_allowed_to_assign(update.message.chat_id, user.id)
+            or await is_chat_admin(context.bot, update.message.chat_id, user.id)):
         return
     parts = [p.strip() for p in " ".join(context.args).split("|")]
     if len(parts) != 3:
@@ -580,20 +584,39 @@ async def task_command(update, context):
     await save_and_reply(update, context, result)
 
 
+def deadline_icon(deadline: datetime, now: datetime) -> str:
+    hours_left = (deadline - now).total_seconds() / 3600
+    return "🔴" if hours_left < 0 else "🟠" if hours_left <= 2 else "🟡" if hours_left <= 24 else "🟢"
+
+
 async def tasks_command(update, context):
-    tasks = db.get_active_tasks(update.message.chat_id)
+    """In a group — everything open there. In a DM — the caller's own tasks
+    from every group, so a colleague can check what's on them without scrolling."""
+    private = update.message.chat.type == "private"
+    if private:
+        tasks = db.get_active_tasks_for_user(update.message.from_user.id)
+        header = "📋 *Твої активні задачі:*\n"
+        empty = "У тебе немає активних задач ✨"
+    else:
+        tasks = db.get_active_tasks(update.message.chat_id)
+        header = "📋 *Активні задачі:*\n"
+        empty = "Активних задач немає ✨"
+
     if not tasks:
-        await update.message.reply_text("Активних задач немає ✨")
+        await update.message.reply_text(empty)
         return
-    lines = ["📋 *Активні задачі:*\n"]
+
     now = now_kyiv()
+    lines = [header]
     for t in tasks:
         deadline = datetime.fromisoformat(t["deadline"])
-        hours_left = (deadline - now).total_seconds() / 3600
-        icon = "🔴" if hours_left < 0 else "🟠" if hours_left <= 2 else "🟡" if hours_left <= 24 else "🟢"
-        lines.append(
-            f"{icon} #{t['id']} | {t['assignee']} | {t['task_text']} | {deadline.strftime('%d.%m %H:%M')}"
-        )
+        icon = deadline_icon(deadline, now)
+        if private:
+            lines.append(f"{icon} #{t['id']} | {t['task_text']} | {deadline.strftime('%d.%m %H:%M')}")
+        else:
+            lines.append(
+                f"{icon} #{t['id']} | {t['assignee']} | {t['task_text']} | {deadline.strftime('%d.%m %H:%M')}"
+            )
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -613,11 +636,79 @@ async def done_command(update, context):
     if task["is_done"]:
         await update.message.reply_text(f"Задача #{task_id} вже виконана")
         return
+    if not await can_act_on_task(context, task, update.message.from_user):
+        await update.message.reply_text("❌ Цю задачу може закрити лише виконавець або менеджер")
+        return
     await close_task(context, task_id, update.message.from_user)
 
 
+async def cancel_command(update, context):
+    """Remove a task created by mistake (misheard voice, wrong assignee).
+    Cancelled tasks stop reminders and stay out of /stats."""
+    user = update.message.from_user
+    if not context.args:
+        await update.message.reply_text("Використання: /cancel <id>  — скасувати помилкову задачу")
+        return
+    try:
+        task_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID має бути числом")
+        return
+
+    task = db.get_task(task_id)
+    if not task:
+        await update.message.reply_text(f"❌ Задача #{task_id} не знайдена")
+        return
+    if task["is_done"]:
+        await update.message.reply_text(f"Задача #{task_id} вже закрита")
+        return
+    if not (is_allowed_to_assign(task["chat_id"], user.id)
+            or await is_chat_admin(context.bot, task["chat_id"], user.id)):
+        await update.message.reply_text("❌ Скасувати задачу може лише менеджер або адмін групи")
+        return
+
+    db.cancel_task(task_id, now_kyiv().isoformat())
+    who = f"@{user.username}" if user.username else user.first_name
+    text = f"🗑 {who} скасував(ла) задачу #{task_id}\n📋 {task['task_text']}\n(не рахується в статистиці)"
+    await update.message.reply_text(text)
+    if update.message.chat_id != task["chat_id"]:
+        try:
+            await context.bot.send_message(chat_id=task["chat_id"], text=text)
+        except Exception as e:
+            logger.error(f"Group cancel announce failed: {e}")
+
+    uid = assignee_user_id(task)
+    if uid and uid != user.id:
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=f"🗑 Задачу #{task_id} скасовано — виконувати не треба.\n📋 {task['task_text']}",
+            )
+        except Exception as e:
+            logger.warning(f"DM cancel notify failed: {e}")
+
+
+async def help_command(update, context):
+    await update.message.reply_text(
+        "🤖 *Що я вмію*\n\n"
+        "Просто напиши або надиктуй у групі: «Максим, зроби звіт до завтра 10:00» — "
+        "я сам розпізнаю виконавця й дедлайн.\n\n"
+        "*Команди*\n"
+        "/tasks — активні задачі (в особистих — твої власні)\n"
+        "/task ім'я | опис | дд.мм.рррр гг:хх — задача вручну\n"
+        "/done <id> — закрити задачу\n"
+        "/cancel <id> — скасувати помилкову задачу\n"
+        "/stats — статистика виконання\n"
+        "/team — склад команди\n"
+        "/add ім'я @username — додати людину\n"
+        "/manager ім'я [remove] — права ставити задачі\n"
+        "/remove ім'я — прибрати з команди",
+        parse_mode="Markdown",
+    )
+
+
 async def stats_command(update, context):
-    stats = db.get_stats(update.message.chat_id)
+    stats = db.get_stats(update.message.chat_id, now_kyiv().isoformat())
     if not stats:
         await update.message.reply_text("Немає даних")
         return
@@ -715,6 +806,43 @@ async def check_deadlines(application):
             db.mark_reminded(t["id"], "reminded_overdue")
 
 
+async def morning_digest(application):
+    """09:05 Kyiv — DM everyone their own open tasks: overdue first, then today.
+    Silent for people with nothing due, so the digest stays worth reading."""
+    now = now_kyiv()
+    today = now.date()
+    for person in db.get_digest_recipients():
+        tasks = db.get_active_tasks_for_user(person["user_id"])
+        overdue, due_today = [], []
+        for t in tasks:
+            deadline = datetime.fromisoformat(t["deadline"])
+            if deadline < now:
+                overdue.append((t, deadline))
+            elif deadline.date() == today:
+                due_today.append((t, deadline))
+        if not overdue and not due_today:
+            continue
+
+        lines = [f"☀️ *Доброго ранку, {person['name']}!*\n"]
+        if overdue:
+            lines.append("🔴 *Прострочено:*")
+            for t, deadline in overdue:
+                lines.append(f"• #{t['id']} {t['task_text']} — було до {deadline.strftime('%d.%m %H:%M')}")
+            lines.append("")
+        if due_today:
+            lines.append("📅 *Сьогодні:*")
+            for t, deadline in due_today:
+                lines.append(f"• #{t['id']} {t['task_text']} — до {deadline.strftime('%H:%M')}")
+        lines.append("\nЗакрити задачу: /done <id> або кнопка ✅ під нею.")
+
+        try:
+            await application.bot.send_message(
+                chat_id=person["user_id"], text="\n".join(lines), parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.warning(f"Morning digest DM to {person['user_id']} failed: {e}")
+
+
 async def connect_digest(application):
     """Once a day, DM the owner the list of members who haven't pressed Start yet."""
     pending = []
@@ -778,12 +906,15 @@ def main():
     app.add_handler(CommandHandler("task", task_command))
     app.add_handler(CommandHandler("tasks", tasks_command))
     app.add_handler(CommandHandler("done", done_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(done_callback, pattern=r"^done:\d+$"))
     app.add_handler(CallbackQueryHandler(snooze_callback, pattern=r"^snooze:\d+:(1h|3h|1d)$"))
     scheduler = AsyncIOScheduler(timezone=KYIV_TZ)
     scheduler.add_job(check_deadlines, "interval", minutes=5, args=[app])
     scheduler.add_job(connect_digest, "cron", hour=9, minute=0, args=[app])
+    scheduler.add_job(morning_digest, "cron", hour=9, minute=5, day_of_week="mon-fri", args=[app])
     scheduler.start()
     logger.info("trofim_bot started")
     # Explicitly request ALL update types — Telegram otherwise remembers the last

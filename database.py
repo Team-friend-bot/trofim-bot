@@ -1,6 +1,18 @@
 import os
 import sqlite3
-from typing import List, Dict
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+try:
+    KYIV_TZ = ZoneInfo("Europe/Kyiv")
+except ZoneInfoNotFoundError:
+    KYIV_TZ = timezone(timedelta(hours=3))  # EEST fallback
+
+
+def _utc_str_to_kyiv_iso(value: str) -> str:
+    """'2026-08-26 11:00:00' (UTC, sqlite datetime('now')) -> '2026-08-26T14:00:00' (Kyiv)."""
+    dt = datetime.strptime(value[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    return dt.astimezone(KYIV_TZ).replace(tzinfo=None).isoformat()
 
 
 class Database:
@@ -56,26 +68,55 @@ class Database:
                 conn.execute("ALTER TABLE members ADD COLUMN started INTEGER DEFAULT 0")
             except Exception:
                 pass
+            # Migration: cancelled tasks stay in the table (audit trail) but are
+            # excluded from reminders, /tasks and /stats.
+            try:
+                conn.execute("ALTER TABLE tasks ADD COLUMN is_cancelled INTEGER DEFAULT 0")
+            except Exception:
+                pass
+            self._normalize_timestamps(conn)
 
-    def add_task(self, chat_id, task_text, assignee, deadline, created_by):
+    @staticmethod
+    def _normalize_timestamps(conn):
+        """created_at/done_at used to be sqlite datetime('now') — UTC, space-separated.
+        Deadlines are Kyiv-local ISO ('...T...'), so the two were never comparable:
+        a task closed on time looked 3 hours late in /stats. Rewrite the old rows to
+        Kyiv ISO once; rows already carrying 'T' are left alone, so this is idempotent."""
+        for column in ("created_at", "done_at"):
+            rows = conn.execute(
+                f"SELECT id, {column} FROM tasks "
+                f"WHERE {column} IS NOT NULL AND {column} LIKE '____-__-__ __:__:__%'"
+            ).fetchall()
+            for row in rows:
+                try:
+                    converted = _utc_str_to_kyiv_iso(row[column])
+                except ValueError:
+                    continue
+                conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (converted, row["id"]))
+
+    def add_task(self, chat_id, task_text, assignee, deadline, created_by, created_at):
         with self._get_conn() as conn:
             cursor = conn.execute(
-                "INSERT INTO tasks (chat_id, task_text, assignee, deadline, created_by) VALUES (?, ?, ?, ?, ?)",
-                (chat_id, task_text, assignee, deadline, created_by)
+                "INSERT INTO tasks (chat_id, task_text, assignee, deadline, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (chat_id, task_text, assignee, deadline, created_by, created_at)
             )
             return cursor.lastrowid
 
     def get_active_tasks(self, chat_id):
         with self._get_conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM tasks WHERE chat_id = ? AND is_done = 0 ORDER BY deadline",
+                "SELECT * FROM tasks WHERE chat_id = ? AND is_done = 0 AND COALESCE(is_cancelled, 0) = 0 "
+                "ORDER BY deadline",
                 (chat_id,)
             ).fetchall()
             return [dict(row) for row in rows]
 
     def get_tasks_for_reminder(self):
         with self._get_conn() as conn:
-            rows = conn.execute("SELECT * FROM tasks WHERE is_done = 0").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE is_done = 0 AND COALESCE(is_cancelled, 0) = 0"
+            ).fetchall()
             return [dict(row) for row in rows]
 
     def get_task(self, task_id):
@@ -99,11 +140,20 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
-    def mark_done(self, task_id):
+    def mark_done(self, task_id, done_at):
         with self._get_conn() as conn:
             conn.execute(
-                "UPDATE tasks SET is_done = 1, done_at = datetime('now') WHERE id = ?",
-                (task_id,)
+                "UPDATE tasks SET is_done = 1, done_at = ? WHERE id = ?",
+                (done_at, task_id)
+            )
+
+    def cancel_task(self, task_id, cancelled_at):
+        """Close a task without counting it as done — mistakes from voice recognition
+        shouldn't spam reminders or drag the assignee's stats down."""
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE tasks SET is_done = 1, is_cancelled = 1, done_at = ? WHERE id = ?",
+                (cancelled_at, task_id)
             )
 
     def update_deadline(self, task_id, new_deadline):
@@ -118,7 +168,7 @@ class Database:
         with self._get_conn() as conn:
             conn.execute(f"UPDATE tasks SET {field} = 1 WHERE id = ?", (task_id,))
 
-    def get_stats(self, chat_id):
+    def get_stats(self, chat_id, now_iso):
         with self._get_conn() as conn:
             rows = conn.execute("""
                 SELECT
@@ -127,9 +177,11 @@ class Database:
                     SUM(CASE WHEN is_done = 1 THEN 1 ELSE 0 END) as done,
                     SUM(CASE WHEN is_done = 1 AND done_at <= deadline THEN 1 ELSE 0 END) as on_time,
                     SUM(CASE WHEN is_done = 1 AND done_at > deadline THEN 1 ELSE 0 END) as late,
-                    SUM(CASE WHEN is_done = 0 AND deadline < datetime('now') THEN 1 ELSE 0 END) as overdue
-                FROM tasks WHERE chat_id = ? GROUP BY assignee
-            """, (chat_id,)).fetchall()
+                    SUM(CASE WHEN is_done = 0 AND deadline < ? THEN 1 ELSE 0 END) as overdue
+                FROM tasks
+                WHERE chat_id = ? AND COALESCE(is_cancelled, 0) = 0
+                GROUP BY assignee
+            """, (now_iso, chat_id)).fetchall()
             return [dict(row) for row in rows]
 
     def add_member(self, chat_id, name, username, user_id=None):
@@ -215,3 +267,28 @@ class Database:
         with self._get_conn() as conn:
             rows = conn.execute("SELECT DISTINCT chat_id FROM members").fetchall()
             return [r["chat_id"] for r in rows]
+
+    def get_active_tasks_for_user(self, user_id):
+        """Every open task assigned to this person, across all their groups.
+        The assignee column holds '@username' or a bare name, so match on both."""
+        with self._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT DISTINCT t.* FROM tasks t
+                JOIN members m ON m.chat_id = t.chat_id
+                WHERE m.user_id = ?
+                  AND t.is_done = 0 AND COALESCE(t.is_cancelled, 0) = 0
+                  AND (LOWER(t.assignee) = LOWER('@' || COALESCE(m.username, ''))
+                       OR LOWER(t.assignee) = LOWER(m.name))
+                ORDER BY t.deadline
+            """, (user_id,)).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_digest_recipients(self):
+        """Everyone reachable in DM (pressed Start), one row per person."""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT user_id, MIN(name) AS name FROM members "
+                "WHERE user_id IS NOT NULL AND COALESCE(started, 0) = 1 "
+                "GROUP BY user_id"
+            ).fetchall()
+            return [dict(row) for row in rows]
