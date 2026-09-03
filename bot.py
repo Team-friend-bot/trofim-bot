@@ -23,6 +23,7 @@ def now_kyiv() -> datetime:
 def today_kyiv() -> date:
     return now_kyiv().date()
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler,
     CallbackQueryHandler, filters,
@@ -41,6 +42,14 @@ logger.info(f"Bot starting. OWNER_ID={OWNER_ID}")
 
 db = Database()
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+def md(text) -> str:
+    """Escape user-supplied text for parse_mode="Markdown".
+    Telegram rejects the whole message when an entity is left unclosed, so an
+    ordinary username like @andrii_smith or a task text with * silently killed
+    the reminder (only a log line was left behind)."""
+    return escape_markdown(str(text), version=1)
 
 
 def parse_deadline(s: str) -> datetime:
@@ -224,7 +233,7 @@ async def save_and_reply(update, context, result, source=""):
                 chat_id=member["user_id"],
                 text=(
                     f"📌 *Тобі поставлена задача #{task_id}*\n\n"
-                    f"📋 {result['task']}\n"
+                    f"📋 {md(result['task'])}\n"
                     f"📅 Дедлайн: {deadline_fmt}\n\n"
                     f"Коли виконаєш — натисни кнопку ⬇️"
                 ),
@@ -523,7 +532,7 @@ async def team_command(update, context):
     for m in members:
         connected = "✅" if m.get("started") else "⚠️"
         role = " 👔 менеджер" if m.get("is_manager") else ""
-        lines.append(f"{connected} {m['name']} → @{m['username']}{role}")
+        lines.append(f"{connected} {md(m['name'])} → @{md(m['username'])}{role}")
     lines.append("\n✅ — підключений  ⚠️ — ще не написав /start\n👔 — може ставити задачі")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -612,10 +621,11 @@ async def tasks_command(update, context):
         deadline = datetime.fromisoformat(t["deadline"])
         icon = deadline_icon(deadline, now)
         if private:
-            lines.append(f"{icon} #{t['id']} | {t['task_text']} | {deadline.strftime('%d.%m %H:%M')}")
+            lines.append(f"{icon} #{t['id']} | {md(t['task_text'])} | {deadline.strftime('%d.%m %H:%M')}")
         else:
             lines.append(
-                f"{icon} #{t['id']} | {t['assignee']} | {t['task_text']} | {deadline.strftime('%d.%m %H:%M')}"
+                f"{icon} #{t['id']} | {md(t['assignee'])} | {md(t['task_text'])} | "
+                f"{deadline.strftime('%d.%m %H:%M')}"
             )
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -688,6 +698,151 @@ async def cancel_command(update, context):
             logger.warning(f"DM cancel notify failed: {e}")
 
 
+async def deadline_command(update, context):
+    """/deadline <id> дд.мм[.рррр] гг:хх — точна нова дата, коли кнопок +1/+3 год мало."""
+    if len(context.args) < 2:
+        await update.message.reply_text("Використання: /deadline <id> дд.мм.рррр гг:хх")
+        return
+    try:
+        task_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID має бути числом")
+        return
+    try:
+        new_deadline = parse_deadline(" ".join(context.args[1:]))
+    except ValueError:
+        await update.message.reply_text("❌ Невірний формат дати. Приклад: /deadline 42 28.08 15:00")
+        return
+
+    task = db.get_task(task_id)
+    if not task:
+        await update.message.reply_text(f"❌ Задача #{task_id} не знайдена")
+        return
+    if task["is_done"]:
+        await update.message.reply_text(f"Задача #{task_id} вже закрита")
+        return
+    user = update.message.from_user
+    if not await can_act_on_task(context, task, user):
+        await update.message.reply_text("❌ Перенести дедлайн може лише виконавець або менеджер")
+        return
+
+    db.update_deadline(task_id, new_deadline.isoformat())
+    deadline_fmt = new_deadline.strftime("%d.%m.%Y %H:%M")
+    who = f"@{user.username}" if user.username else user.first_name
+    text = (
+        f"📅 {md(who)} переніс(ла) дедлайн задачі #{task_id}\n"
+        f"📋 {md(task['task_text'])}\n"
+        f"📅 Новий дедлайн: {deadline_fmt}"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=done_keyboard(task_id))
+    await notify_task_parties(context, task, update.message.chat_id, user.id, text)
+
+
+async def reassign_command(update, context):
+    """/reassign <id> ім'я — коли голосом розпізнало не того виконавця."""
+    if len(context.args) < 2:
+        await update.message.reply_text("Використання: /reassign <id> ім'я  (або @username)")
+        return
+    try:
+        task_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID має бути числом")
+        return
+
+    task = db.get_task(task_id)
+    if not task:
+        await update.message.reply_text(f"❌ Задача #{task_id} не знайдена")
+        return
+    if task["is_done"]:
+        await update.message.reply_text(f"Задача #{task_id} вже закрита")
+        return
+    user = update.message.from_user
+    if not (is_allowed_to_assign(task["chat_id"], user.id)
+            or await is_chat_admin(context.bot, task["chat_id"], user.id)):
+        await update.message.reply_text("❌ Перепризначити задачу може лише менеджер або адмін групи")
+        return
+
+    raw = context.args[1]
+    member = (db.get_member_by_username(task["chat_id"], raw) if raw.startswith("@")
+              else db.get_member(task["chat_id"], raw))
+    if not member:
+        await update.message.reply_text(
+            f"❌ {raw} не знайдений у команді цієї групи. Список: /team"
+        )
+        return
+    new_tag = f"@{member['username']}" if member.get("username") else member["name"]
+    old_tag = task["assignee"]
+    if new_tag.lower() == old_tag.lower():
+        await update.message.reply_text(f"Задача #{task_id} вже на {md(new_tag)}", parse_mode="Markdown")
+        return
+
+    old_uid = assignee_user_id(task)
+    db.reassign_task(task_id, new_tag)
+    who = f"@{user.username}" if user.username else user.first_name
+    deadline_fmt = datetime.fromisoformat(task["deadline"]).strftime("%d.%m.%Y %H:%M")
+    text = (
+        f"🔄 {md(who)} перепризначив(ла) задачу #{task_id}\n"
+        f"👤 {md(old_tag)} → {md(new_tag)}\n"
+        f"📋 {md(task['task_text'])}\n"
+        f"📅 Дедлайн: {deadline_fmt}"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=done_keyboard(task_id))
+    if update.message.chat_id != task["chat_id"]:
+        try:
+            await context.bot.send_message(
+                chat_id=task["chat_id"], text=text,
+                parse_mode="Markdown", reply_markup=done_keyboard(task_id),
+            )
+        except Exception as e:
+            logger.error(f"Group reassign announce failed: {e}")
+
+    if old_uid and old_uid != user.id:
+        try:
+            await context.bot.send_message(
+                chat_id=old_uid,
+                text=f"🔄 Задачу #{task_id} передано іншій людині — робити не треба.\n"
+                     f"📋 {md(task['task_text'])}",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning(f"DM reassign notify (old) failed: {e}")
+    if member.get("user_id"):
+        try:
+            await context.bot.send_message(
+                chat_id=member["user_id"],
+                text=(
+                    f"📌 *Тобі передана задача #{task_id}*\n\n"
+                    f"📋 {md(task['task_text'])}\n"
+                    f"📅 Дедлайн: {deadline_fmt}\n\n"
+                    f"Коли виконаєш — натисни кнопку ⬇️"
+                ),
+                parse_mode="Markdown", reply_markup=done_keyboard(task_id),
+            )
+        except Exception as e:
+            logger.warning(f"DM reassign notify (new) failed: {e}")
+
+
+async def notify_task_parties(context, task, from_chat_id, actor_id, text):
+    """Mirror a task change to the task's group and to its assignee's DM."""
+    if from_chat_id != task["chat_id"]:
+        try:
+            await context.bot.send_message(
+                chat_id=task["chat_id"], text=text,
+                parse_mode="Markdown", reply_markup=done_keyboard(task["id"]),
+            )
+        except Exception as e:
+            logger.error(f"Group announce failed: {e}")
+    uid = assignee_user_id(task)
+    if uid and uid != actor_id:
+        try:
+            await context.bot.send_message(
+                chat_id=uid, text=text,
+                parse_mode="Markdown", reply_markup=done_keyboard(task["id"]),
+            )
+        except Exception as e:
+            logger.warning(f"DM notify failed: {e}")
+
+
 async def help_command(update, context):
     await update.message.reply_text(
         "🤖 *Що я вмію*\n\n"
@@ -698,7 +853,9 @@ async def help_command(update, context):
         "/task ім'я | опис | дд.мм.рррр гг:хх — задача вручну\n"
         "/done <id> — закрити задачу\n"
         "/cancel <id> — скасувати помилкову задачу\n"
-        "/stats — статистика виконання\n"
+        "/deadline <id> дд.мм гг:хх — перенести дедлайн\n"
+        "/reassign <id> ім'я — передати задачу іншому\n"
+        "/stats [дні] — статистика (напр. /stats 7)\n"
         "/team — склад команди\n"
         "/add ім'я @username — додати людину\n"
         "/manager ім'я [remove] — права ставити задачі\n"
@@ -708,15 +865,31 @@ async def help_command(update, context):
 
 
 async def stats_command(update, context):
-    stats = db.get_stats(update.message.chat_id, now_kyiv().isoformat())
+    """/stats — за весь час, /stats 7 — за останні 7 днів."""
+    days = None
+    if context.args:
+        try:
+            days = int(context.args[0])
+            if days < 1:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Використання: /stats  або  /stats 7  (за останні N днів)")
+            return
+
+    now = now_kyiv()
+    since = (now - timedelta(days=days)).isoformat() if days else None
+    stats = db.get_stats(update.message.chat_id, now.isoformat(), since)
     if not stats:
-        await update.message.reply_text("Немає даних")
+        await update.message.reply_text(
+            f"За останні {days} дн. задач не було" if days else "Немає даних"
+        )
         return
-    lines = ["📊 *Статистика:*\n"]
+    header = f"📊 *Статистика за {days} дн.:*\n" if days else "📊 *Статистика:*\n"
+    lines = [header]
     for s in stats:
         rate = (s["on_time"] / s["total"] * 100) if s["total"] else 0
         lines.append(
-            f"👤 *{s['assignee']}*\n"
+            f"👤 *{md(s['assignee'])}*\n"
             f"   Всього: {s['total']} | Вчасно: {s['on_time']} | "
             f"Запізно: {s['late']} | Прострочено: {s['overdue']}\n"
             f"   Ефективність: {rate:.0f}%\n"
@@ -736,8 +909,8 @@ async def send_reminder(application, task, when_text: str, urgent: bool):
 
     group_text = (
         f"{icon} *{when_text}*\n"
-        f"❗ Не виконано: {task['assignee']}\n"
-        f"📋 #{task['id']} {task['task_text']}\n"
+        f"❗ Не виконано: {md(task['assignee'])}\n"
+        f"📋 #{task['id']} {md(task['task_text'])}\n"
         f"📅 Дедлайн: {deadline_fmt}"
     )
     kb = done_keyboard(task["id"])
@@ -756,7 +929,7 @@ async def send_reminder(application, task, when_text: str, urgent: bool):
                 chat_id=uid,
                 text=(
                     f"{icon} *{when_text}*\n\n"
-                    f"📋 Задача #{task['id']}: {task['task_text']}\n"
+                    f"📋 Задача #{task['id']}: {md(task['task_text'])}\n"
                     f"📅 Дедлайн: {deadline_fmt}\n\n"
                     f"Натисни кнопку коли виконаєш ⬇️"
                 ),
@@ -773,8 +946,8 @@ async def send_overdue(application, task):
     deadline = datetime.fromisoformat(task["deadline"])
     text = (
         f"🔴 *ПРОСТРОЧЕНО!*\n"
-        f"❗ Не виконав: {task['assignee']}\n"
-        f"📋 #{task['id']} {task['task_text']}\n"
+        f"❗ Не виконав: {md(task['assignee'])}\n"
+        f"📋 #{task['id']} {md(task['task_text'])}\n"
         f"📅 Дедлайн був: {deadline.strftime('%d.%m %H:%M')}"
     )
     try:
@@ -823,16 +996,16 @@ async def morning_digest(application):
         if not overdue and not due_today:
             continue
 
-        lines = [f"☀️ *Доброго ранку, {person['name']}!*\n"]
+        lines = [f"☀️ *Доброго ранку, {md(person['name'])}!*\n"]
         if overdue:
             lines.append("🔴 *Прострочено:*")
             for t, deadline in overdue:
-                lines.append(f"• #{t['id']} {t['task_text']} — було до {deadline.strftime('%d.%m %H:%M')}")
+                lines.append(f"• #{t['id']} {md(t['task_text'])} — було до {deadline.strftime('%d.%m %H:%M')}")
             lines.append("")
         if due_today:
             lines.append("📅 *Сьогодні:*")
             for t, deadline in due_today:
-                lines.append(f"• #{t['id']} {t['task_text']} — до {deadline.strftime('%H:%M')}")
+                lines.append(f"• #{t['id']} {md(t['task_text'])} — до {deadline.strftime('%H:%M')}")
         lines.append("\nЗакрити задачу: /done <id> або кнопка ✅ під нею.")
 
         try:
@@ -841,6 +1014,33 @@ async def morning_digest(application):
             )
         except Exception as e:
             logger.warning(f"Morning digest DM to {person['user_id']} failed: {e}")
+
+
+async def weekly_report(application):
+    """П'ятниця 17:00 — підсумок тижня в кожну групу: хто скільки закрив і що висить."""
+    now = now_kyiv()
+    since = (now - timedelta(days=7)).isoformat()
+    for chat_id in db.get_chat_ids():
+        stats = [s for s in db.get_stats(chat_id, now.isoformat(), since) if s["total"]]
+        if not stats:
+            continue
+        stats.sort(key=lambda s: (-s["done"], s["assignee"]))
+        total = sum(s["total"] for s in stats)
+        done = sum(s["done"] for s in stats)
+        lines = [f"📊 *Підсумки тижня*\nЗакрито {done} із {total} задач\n"]
+        for s in stats:
+            parts = [f"✅ {s['done']}/{s['total']}"]
+            if s["late"]:
+                parts.append(f"⚠️ із запізненням {s['late']}")
+            if s["overdue"]:
+                parts.append(f"🔴 прострочено {s['overdue']}")
+            lines.append(f"👤 *{md(s['assignee'])}* — " + ", ".join(parts))
+        try:
+            await application.bot.send_message(
+                chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Weekly report to {chat_id} failed: {e}")
 
 
 async def connect_digest(application):
@@ -854,7 +1054,7 @@ async def connect_digest(application):
     lines = ["⚠️ *Ще не підключили особисті* (не натиснули Start):\n"]
     for m in pending:
         uname = f"@{m['username']}" if m.get("username") else m["name"]
-        lines.append(f"• {m['name']} — {uname}")
+        lines.append(f"• {md(m['name'])} — {md(uname)}")
     lines.append(
         "\nПопроси їх відкрити @TMO_team_bot і натиснути *Start* — "
         "тоді задачі й нагадування йтимуть їм в особисті. У групі все працює й без цього."
@@ -907,6 +1107,8 @@ def main():
     app.add_handler(CommandHandler("tasks", tasks_command))
     app.add_handler(CommandHandler("done", done_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("deadline", deadline_command))
+    app.add_handler(CommandHandler("reassign", reassign_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(done_callback, pattern=r"^done:\d+$"))
@@ -915,6 +1117,7 @@ def main():
     scheduler.add_job(check_deadlines, "interval", minutes=5, args=[app])
     scheduler.add_job(connect_digest, "cron", hour=9, minute=0, args=[app])
     scheduler.add_job(morning_digest, "cron", hour=9, minute=5, day_of_week="mon-fri", args=[app])
+    scheduler.add_job(weekly_report, "cron", day_of_week="fri", hour=17, minute=0, args=[app])
     scheduler.start()
     logger.info("trofim_bot started")
     # Explicitly request ALL update types — Telegram otherwise remembers the last

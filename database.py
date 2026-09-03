@@ -168,20 +168,23 @@ class Database:
         with self._get_conn() as conn:
             conn.execute(f"UPDATE tasks SET {field} = 1 WHERE id = ?", (task_id,))
 
-    def get_stats(self, chat_id, now_iso):
+    def get_stats(self, chat_id, now_iso, since_iso=None):
+        """since_iso limits the report to tasks created after that moment
+        (all-time stats stop being actionable once a team has months of history)."""
+        period = "AND created_at >= :since" if since_iso else ""
         with self._get_conn() as conn:
-            rows = conn.execute("""
+            rows = conn.execute(f"""
                 SELECT
                     assignee,
                     COUNT(*) as total,
                     SUM(CASE WHEN is_done = 1 THEN 1 ELSE 0 END) as done,
                     SUM(CASE WHEN is_done = 1 AND done_at <= deadline THEN 1 ELSE 0 END) as on_time,
                     SUM(CASE WHEN is_done = 1 AND done_at > deadline THEN 1 ELSE 0 END) as late,
-                    SUM(CASE WHEN is_done = 0 AND deadline < ? THEN 1 ELSE 0 END) as overdue
+                    SUM(CASE WHEN is_done = 0 AND deadline < :now THEN 1 ELSE 0 END) as overdue
                 FROM tasks
-                WHERE chat_id = ? AND COALESCE(is_cancelled, 0) = 0
+                WHERE chat_id = :chat_id AND COALESCE(is_cancelled, 0) = 0 {period}
                 GROUP BY assignee
-            """, (now_iso, chat_id)).fetchall()
+            """, {"now": now_iso, "chat_id": chat_id, "since": since_iso}).fetchall()
             return [dict(row) for row in rows]
 
     def add_member(self, chat_id, name, username, user_id=None):
@@ -292,3 +295,12 @@ class Database:
                 "GROUP BY user_id"
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def reassign_task(self, task_id, assignee):
+        """Point a task at a different person and let the reminders fire again for them."""
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE tasks SET assignee = ?, reminded_1d = 0, reminded_2h = 0, "
+                "reminded_15m = 0, reminded_overdue = 0 WHERE id = ?",
+                (assignee, task_id)
+            )
