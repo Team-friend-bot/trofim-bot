@@ -68,6 +68,19 @@ class Database:
                 conn.execute("ALTER TABLE members ADD COLUMN started INTEGER DEFAULT 0")
             except Exception:
                 pass
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS recurring (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    assignee TEXT NOT NULL,
+                    task_text TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    at_time TEXT NOT NULL,
+                    created_by TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    last_created_date TEXT
+                )
+            """)
             # Migration: cancelled tasks stay in the table (audit trail) but are
             # excluded from reminders, /tasks and /stats.
             try:
@@ -325,3 +338,43 @@ class Database:
     def update_task_text(self, task_id, task_text):
         with self._get_conn() as conn:
             conn.execute("UPDATE tasks SET task_text = ? WHERE id = ?", (task_text, task_id))
+
+    # --- recurring task templates -------------------------------------------------
+
+    def add_recurring(self, chat_id, assignee, task_text, period, at_time, created_by):
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                "INSERT INTO recurring (chat_id, assignee, task_text, period, at_time, created_by) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (chat_id, assignee, task_text, period, at_time, created_by)
+            )
+            return cursor.lastrowid
+
+    def get_recurring(self, chat_id):
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM recurring WHERE chat_id = ? AND is_active = 1 ORDER BY id",
+                (chat_id,)
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_all_recurring(self):
+        with self._get_conn() as conn:
+            rows = conn.execute("SELECT * FROM recurring WHERE is_active = 1 ORDER BY id").fetchall()
+            return [dict(row) for row in rows]
+
+    def deactivate_recurring(self, template_id, chat_id):
+        """Scoped to the chat so one group can't switch off another group's template."""
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                "UPDATE recurring SET is_active = 0 WHERE id = ? AND chat_id = ? AND is_active = 1",
+                (template_id, chat_id)
+            )
+            return cursor.rowcount
+
+    def mark_recurring_created(self, template_id, date_iso):
+        """Guards against a second task on the same day after a restart."""
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE recurring SET last_created_date = ? WHERE id = ?", (date_iso, template_id)
+            )

@@ -3,7 +3,7 @@ import os
 import json
 import logging
 import re
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, time as dtime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import anthropic
@@ -42,6 +42,56 @@ logger.info(f"Bot starting. OWNER_ID={OWNER_ID}")
 
 db = Database()
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+WEEKDAY_CODES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+PERIOD_WORDS = {
+    "щодня": "daily", "щоденно": "daily", "кожен день": "daily",
+    "будні": "weekdays", "щобудня": "weekdays", "по будням": "weekdays",
+    "пн": "mon", "щопонеділка": "mon", "понеділок": "mon",
+    "вт": "tue", "щовівторка": "tue", "вівторок": "tue",
+    "ср": "wed", "щосереди": "wed", "середа": "wed",
+    "чт": "thu", "щочетверга": "thu", "четвер": "thu",
+    "пт": "fri", "щопятниці": "fri", "щоп'ятниці": "fri", "пятниця": "fri", "п'ятниця": "fri",
+    "сб": "sat", "щосуботи": "sat", "субота": "sat",
+    "нд": "sun", "щонеділі": "sun", "неділя": "sun",
+}
+PERIOD_LABELS = {
+    "daily": "щодня", "weekdays": "щобудня", "mon": "щопонеділка", "tue": "щовівторка",
+    "wed": "щосереди", "thu": "щочетверга", "fri": "щоп'ятниці", "sat": "щосуботи",
+    "sun": "щонеділі",
+}
+
+
+def parse_period(word: str) -> str | None:
+    """'щодня' / 'пн' / '15' (число місяця) -> stored period code."""
+    w = word.strip().lower()
+    if w in PERIOD_WORDS:
+        return PERIOD_WORDS[w]
+    if w.isdigit() and 1 <= int(w) <= 31:
+        return f"day:{int(w)}"
+    return None
+
+
+def period_label(period: str) -> str:
+    if period.startswith("day:"):
+        return f"{period[4:]} числа щомісяця"
+    return PERIOD_LABELS.get(period, period)
+
+
+def is_due_today(period: str, day: date) -> bool:
+    if period == "daily":
+        return True
+    if period == "weekdays":
+        return day.weekday() < 5
+    if period in WEEKDAY_CODES:
+        return day.weekday() == WEEKDAY_CODES.index(period)
+    if period.startswith("day:"):
+        wanted = int(period[4:])
+        last_day = (day.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        # 31-е у короткому місяці -> останній день, інакше задача просто зникає
+        return day.day == min(wanted, last_day.day)
+    return False
 
 
 def md(text) -> str:
@@ -610,6 +660,19 @@ async def tasks_command(update, context):
         tasks = db.get_active_tasks(update.message.chat_id)
         header = "📋 *Активні задачі:*\n"
         empty = "Активних задач немає ✨"
+        if context.args:
+            raw = context.args[0]
+            member = (db.get_member_by_username(update.message.chat_id, raw) if raw.startswith("@")
+                      else db.get_member(update.message.chat_id, raw))
+            wanted = {raw.lower()}
+            if member:
+                wanted.add(member["name"].lower())
+                if member.get("username"):
+                    wanted.add(f"@{member['username']}".lower())
+            tasks = [t for t in tasks if t["assignee"].lower() in wanted]
+            who = member["name"] if member else raw
+            header = f"📋 *Активні задачі — {md(who)}:*\n"
+            empty = f"У {who} немає активних задач ✨"
 
     if not tasks:
         await update.message.reply_text(empty)
@@ -917,6 +980,160 @@ async def export_command(update, context):
         await update.message.reply_text(f"❌ Не вдалося сформувати файл: {type(e).__name__}")
 
 
+async def repeat_command(update, context):
+    """/repeat період гг:хх | ім'я | опис — шаблон повторюваної задачі.
+    Без аргументів показує активні шаблони цієї групи."""
+    chat_id = update.message.chat_id
+    user = update.message.from_user
+    if update.message.chat.type == "private":
+        await update.message.reply_text("Команду треба писати в групі команди")
+        return
+
+    templates = db.get_recurring(chat_id)
+    raw = (update.message.text or "").split(maxsplit=1)
+    if len(raw) < 2:
+        lines = ["🔁 *Повторювані задачі*\n"]
+        if templates:
+            for r in templates:
+                lines.append(
+                    f"#{r['id']} | {md(r['assignee'])} | {md(r['task_text'])} | "
+                    f"{period_label(r['period'])} до {r['at_time']}"
+                )
+            lines.append("\nВидалити: /unrepeat <id>")
+        else:
+            lines.append("Поки жодного шаблону.")
+        lines.append(
+            "\nДодати: `/repeat період гг:хх | ім'я | опис`\n"
+            "Період: щодня, будні, пн…нд або число місяця (1–31)\n"
+            "Приклад: `/repeat пн 12:00 | Андрій | звіт по закупівлях за тиждень`"
+        )
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    if not (is_allowed_to_assign(chat_id, user.id)
+            or await is_chat_admin(context.bot, chat_id, user.id)):
+        await update.message.reply_text("❌ Створювати повторювані задачі може лише менеджер або адмін")
+        return
+
+    parts = [x.strip() for x in raw[1].split("|")]
+    if len(parts) != 3:
+        await update.message.reply_text(
+            "📝 Формат: /repeat період гг:хх | ім'я | опис\n"
+            "Приклад: /repeat пн 12:00 | Андрій | звіт по закупівлях"
+        )
+        return
+
+    when, name, task_text = parts
+    when_parts = when.split()
+    if len(when_parts) != 2:
+        await update.message.reply_text("❌ Вкажи період і час, напр. «пн 12:00» або «щодня 10:00»")
+        return
+    period = parse_period(when_parts[0])
+    if not period:
+        await update.message.reply_text(
+            "❌ Не розпізнав період. Можна: щодня, будні, пн/вт/ср/чт/пт/сб/нд або число 1–31"
+        )
+        return
+    try:
+        at = datetime.strptime(when_parts[1], "%H:%M")
+    except ValueError:
+        await update.message.reply_text("❌ Час у формі гг:хх, напр. 12:00")
+        return
+
+    member = (db.get_member_by_username(chat_id, name) if name.startswith("@")
+              else db.get_member(chat_id, name))
+    if not member:
+        await update.message.reply_text(f"❌ {name} не знайдений у команді. Список: /team")
+        return
+    tag = f"@{member['username']}" if member.get("username") else member["name"]
+
+    template_id = db.add_recurring(
+        chat_id, tag, task_text, period, at.strftime("%H:%M"), user.first_name
+    )
+    await update.message.reply_text(
+        f"🔁 Шаблон #{template_id} створено\n"
+        f"👤 {md(tag)}\n"
+        f"📋 {md(task_text)}\n"
+        f"📅 {period_label(period)} до {at.strftime('%H:%M')}\n\n"
+        f"Задача створюватиметься автоматично зранку того дня. Видалити: /unrepeat {template_id}",
+        parse_mode="Markdown",
+    )
+
+
+async def unrepeat_command(update, context):
+    user = update.message.from_user
+    chat_id = update.message.chat_id
+    if not context.args:
+        await update.message.reply_text("Використання: /unrepeat <id>  (список: /repeat)")
+        return
+    try:
+        template_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID має бути числом")
+        return
+    if not (is_allowed_to_assign(chat_id, user.id)
+            or await is_chat_admin(context.bot, chat_id, user.id)):
+        await update.message.reply_text("❌ Видаляти шаблони може лише менеджер або адмін")
+        return
+    if db.deactivate_recurring(template_id, chat_id):
+        await update.message.reply_text(f"✅ Шаблон #{template_id} вимкнено — нових задач не буде")
+    else:
+        await update.message.reply_text(f"❌ Шаблон #{template_id} не знайдений у цій групі")
+
+
+async def create_recurring_tasks(application):
+    """07:00 Kyiv — розкладає на сьогодні всі шаблони, чий день настав.
+    Створюємо зранку, а не в момент дедлайну, щоб нагадування мали за що спрацювати."""
+    now = now_kyiv()
+    today = now.date()
+    for r in db.get_all_recurring():
+        if r.get("last_created_date") == today.isoformat():
+            continue  # уже створено сьогодні (напр. після перезапуску)
+        if not is_due_today(r["period"], today):
+            continue
+        hour, minute = (int(x) for x in r["at_time"].split(":"))
+        deadline = datetime.combine(today, dtime(hour=hour, minute=minute))
+
+        task_id = db.add_task(
+            chat_id=r["chat_id"], task_text=r["task_text"], assignee=r["assignee"],
+            deadline=deadline.isoformat(), created_by=r.get("created_by") or "бот",
+            created_at=now.isoformat(),
+        )
+        db.mark_recurring_created(r["id"], today.isoformat())
+
+        deadline_fmt = deadline.strftime("%d.%m.%Y %H:%M")
+        kb = done_keyboard(task_id)
+        try:
+            await application.bot.send_message(
+                chat_id=r["chat_id"],
+                text=(
+                    f"🔁 *Повторювана задача #{task_id}*\n"
+                    f"👤 {md(r['assignee'])}\n"
+                    f"📋 {md(r['task_text'])}\n"
+                    f"📅 Дедлайн: {deadline_fmt}"
+                ),
+                parse_mode="Markdown", reply_markup=kb,
+            )
+        except Exception as e:
+            logger.error(f"Recurring announce failed for template {r['id']}: {e}")
+
+        uid = assignee_user_id({"chat_id": r["chat_id"], "assignee": r["assignee"]})
+        if uid:
+            try:
+                await application.bot.send_message(
+                    chat_id=uid,
+                    text=(
+                        f"🔁 *Задача на сьогодні #{task_id}*\n\n"
+                        f"📋 {md(r['task_text'])}\n"
+                        f"📅 Дедлайн: {deadline_fmt}\n\n"
+                        f"Коли виконаєш — натисни кнопку ⬇️"
+                    ),
+                    parse_mode="Markdown", reply_markup=kb,
+                )
+            except Exception as e:
+                logger.warning(f"Recurring DM failed: {e}")
+
+
 async def notify_task_parties(context, task, from_chat_id, actor_id, text):
     """Mirror a task change to the task's group and to its assignee's DM."""
     if from_chat_id != task["chat_id"]:
@@ -944,7 +1161,7 @@ async def help_command(update, context):
         "Просто напиши або надиктуй у групі: «Максим, зроби звіт до завтра 10:00» — "
         "я сам розпізнаю виконавця й дедлайн.\n\n"
         "*Команди*\n"
-        "/tasks — активні задачі (в особистих — твої власні)\n"
+        "/tasks [ім'я] — активні задачі (в особистих — твої власні)\n"
         "/task ім'я | опис | дд.мм.рррр гг:хх — задача вручну\n"
         "/done <id> — закрити задачу\n"
         "/cancel <id> — скасувати помилкову задачу\n"
@@ -952,6 +1169,7 @@ async def help_command(update, context):
         "/reassign <id> ім'я — передати задачу іншому\n"
         "/edit <id> текст — уточнити формулювання\n"
         "/export — усі задачі групи у CSV\n"
+        "/repeat — повторювані задачі (щодня/щотижня)\n"
         "/stats [дні] — статистика (напр. /stats 7)\n"
         "/team — склад команди\n"
         "/add ім'я @username — додати людину\n"
@@ -1222,6 +1440,8 @@ def main():
     app.add_handler(CommandHandler("reassign", reassign_command))
     app.add_handler(CommandHandler("edit", edit_command))
     app.add_handler(CommandHandler("export", export_command))
+    app.add_handler(CommandHandler("repeat", repeat_command))
+    app.add_handler(CommandHandler("unrepeat", unrepeat_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(done_callback, pattern=r"^done:\d+$"))
@@ -1231,6 +1451,7 @@ def main():
     scheduler.add_job(connect_digest, "cron", hour=9, minute=0, args=[app])
     scheduler.add_job(morning_digest, "cron", hour=9, minute=5, day_of_week="mon-fri", args=[app])
     scheduler.add_job(weekly_report, "cron", day_of_week="fri", hour=17, minute=0, args=[app])
+    scheduler.add_job(create_recurring_tasks, "cron", hour=7, minute=0, args=[app])
     scheduler.start()
     logger.info("trofim_bot started")
     # Explicitly request ALL update types — Telegram otherwise remembers the last
