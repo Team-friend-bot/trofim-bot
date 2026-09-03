@@ -164,9 +164,17 @@ class Database:
                 (new_deadline, task_id)
             )
 
-    def mark_reminded(self, task_id, field):
+    REMINDER_FLAGS = ("reminded_1d", "reminded_2h", "reminded_15m", "reminded_overdue")
+
+    def mark_reminded(self, task_id, *fields):
+        """Several flags at once: sending a late-stage reminder also retires the
+        earlier ones, so downtime can't make them all fire in a burst."""
+        unknown = set(fields) - set(self.REMINDER_FLAGS)
+        if unknown:
+            raise ValueError(f"unknown reminder flags: {sorted(unknown)}")
+        assignments = ", ".join(f"{f} = 1" for f in fields)
         with self._get_conn() as conn:
-            conn.execute(f"UPDATE tasks SET {field} = 1 WHERE id = ?", (task_id,))
+            conn.execute(f"UPDATE tasks SET {assignments} WHERE id = ?", (task_id,))
 
     def get_stats(self, chat_id, now_iso, since_iso=None):
         """since_iso limits the report to tasks created after that moment
@@ -304,3 +312,16 @@ class Database:
                 "reminded_15m = 0, reminded_overdue = 0 WHERE id = ?",
                 (assignee, task_id)
             )
+
+    def get_all_tasks(self, chat_id):
+        """Full history for the export, newest first, cancelled ones included
+        (they're flagged in the file rather than hidden)."""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE chat_id = ? ORDER BY id DESC", (chat_id,)
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def update_task_text(self, task_id, task_text):
+        with self._get_conn() as conn:
+            conn.execute("UPDATE tasks SET task_text = ? WHERE id = ?", (task_text, task_id))

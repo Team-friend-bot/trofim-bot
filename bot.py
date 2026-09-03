@@ -822,6 +822,101 @@ async def reassign_command(update, context):
             logger.warning(f"DM reassign notify (new) failed: {e}")
 
 
+async def edit_command(update, context):
+    """/edit <id> новий текст — голос часто перекручує формулювання."""
+    if len(context.args) < 2:
+        await update.message.reply_text("Використання: /edit <id> новий текст задачі")
+        return
+    try:
+        task_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID має бути числом")
+        return
+
+    task = db.get_task(task_id)
+    if not task:
+        await update.message.reply_text(f"❌ Задача #{task_id} не знайдена")
+        return
+    if task["is_done"]:
+        await update.message.reply_text(f"Задача #{task_id} вже закрита")
+        return
+    user = update.message.from_user
+    if not (is_allowed_to_assign(task["chat_id"], user.id)
+            or await is_chat_admin(context.bot, task["chat_id"], user.id)):
+        await update.message.reply_text("❌ Змінити текст задачі може лише менеджер або адмін групи")
+        return
+
+    new_text = " ".join(context.args[1:]).strip()
+    db.update_task_text(task_id, new_text)
+    who = f"@{user.username}" if user.username else user.first_name
+    text = (
+        f"✏️ {md(who)} уточнив(ла) задачу #{task_id}\n"
+        f"було: {md(task['task_text'])}\n"
+        f"стало: {md(new_text)}\n"
+        f"📅 Дедлайн: {datetime.fromisoformat(task['deadline']).strftime('%d.%m.%Y %H:%M')}"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=done_keyboard(task_id))
+    await notify_task_parties(context, task, update.message.chat_id, user.id, text)
+
+
+def tasks_csv(tasks, now: datetime) -> bytes:
+    """utf-8-sig so Excel opens Ukrainian text without a mangled first column."""
+    import csv, io
+    buf = io.StringIO()
+    writer = csv.writer(buf, delimiter=";")
+    writer.writerow([
+        "id", "виконавець", "задача", "дедлайн", "поставив",
+        "створено", "статус", "закрито", "запізнення (хв)",
+    ])
+    for t in tasks:
+        deadline = datetime.fromisoformat(t["deadline"])
+        done_at = datetime.fromisoformat(t["done_at"]) if t.get("done_at") else None
+        if t.get("is_cancelled"):
+            status, late_min = "скасовано", ""
+        elif t["is_done"]:
+            late = (done_at - deadline).total_seconds() / 60 if done_at else 0
+            status = "вчасно" if late <= 0 else "із запізненням"
+            late_min = max(0, int(late))
+        else:
+            status = "прострочено" if deadline < now else "в роботі"
+            late_min = int((now - deadline).total_seconds() / 60) if deadline < now else ""
+        writer.writerow([
+            t["id"], t["assignee"], t["task_text"], deadline.strftime("%d.%m.%Y %H:%M"),
+            t.get("created_by") or "", (t.get("created_at") or "")[:16].replace("T", " "),
+            status, done_at.strftime("%d.%m.%Y %H:%M") if done_at else "", late_min,
+        ])
+    return buf.getvalue().encode("utf-8-sig")
+
+
+async def export_command(update, context):
+    """/export — усі задачі групи у CSV для звітності (Excel-friendly)."""
+    user = update.message.from_user
+    chat_id = update.message.chat_id
+    if update.message.chat.type == "private":
+        await update.message.reply_text("Команду треба писати в групі — експорт іде по задачах групи")
+        return
+    if not (is_allowed_to_assign(chat_id, user.id)
+            or await is_chat_admin(context.bot, chat_id, user.id)):
+        return
+
+    tasks = db.get_all_tasks(chat_id)
+    if not tasks:
+        await update.message.reply_text("Немає задач для експорту")
+        return
+
+    now = now_kyiv()
+    payload = tasks_csv(tasks, now)
+    filename = f"tasks_{now.strftime('%Y-%m-%d')}.csv"
+    try:
+        await context.bot.send_document(
+            chat_id=chat_id, document=payload, filename=filename,
+            caption=f"📄 Експорт задач: {len(tasks)} шт. станом на {now.strftime('%d.%m.%Y %H:%M')}",
+        )
+    except Exception as e:
+        logger.error(f"Export failed: {e}")
+        await update.message.reply_text(f"❌ Не вдалося сформувати файл: {type(e).__name__}")
+
+
 async def notify_task_parties(context, task, from_chat_id, actor_id, text):
     """Mirror a task change to the task's group and to its assignee's DM."""
     if from_chat_id != task["chat_id"]:
@@ -855,6 +950,8 @@ async def help_command(update, context):
         "/cancel <id> — скасувати помилкову задачу\n"
         "/deadline <id> дд.мм гг:хх — перенести дедлайн\n"
         "/reassign <id> ім'я — передати задачу іншому\n"
+        "/edit <id> текст — уточнити формулювання\n"
+        "/export — усі задачі групи у CSV\n"
         "/stats [дні] — статистика (напр. /stats 7)\n"
         "/team — склад команди\n"
         "/add ім'я @username — додати людину\n"
@@ -959,24 +1056,38 @@ async def send_overdue(application, task):
         logger.error(f"Overdue announce failed: {e}")
 
 
+# Most urgent first. Each level fires once the deadline is within `minutes`,
+# not inside a narrow window: a task set 12 minutes before its deadline, or a
+# restart that stepped over the window, used to lose the reminder entirely.
+REMINDER_LEVELS = [
+    ("reminded_15m", 20, "Залишилось 15 хвилин", True),
+    ("reminded_2h", 130, "Залишилось 2 години", True),
+    ("reminded_1d", 25 * 60, "Залишилось 24 години", False),
+]
+
+
 async def check_deadlines(application):
     tasks = db.get_tasks_for_reminder()
     now = now_kyiv()
     for t in tasks:
         deadline = datetime.fromisoformat(t["deadline"])
         minutes_left = (deadline - now).total_seconds() / 60
-        if 23 * 60 <= minutes_left <= 25 * 60 and not t["reminded_1d"]:
-            await send_reminder(application, t, "Залишилось 24 години", urgent=False)
-            db.mark_reminded(t["id"], "reminded_1d")
-        elif 110 <= minutes_left <= 130 and not t["reminded_2h"]:
-            await send_reminder(application, t, "Залишилось 2 години", urgent=True)
-            db.mark_reminded(t["id"], "reminded_2h")
-        elif 10 <= minutes_left <= 20 and not t["reminded_15m"]:
-            await send_reminder(application, t, "Залишилось 15 хвилин", urgent=True)
-            db.mark_reminded(t["id"], "reminded_15m")
-        elif minutes_left < 0 and not t["reminded_overdue"]:
-            await send_overdue(application, t)
-            db.mark_reminded(t["id"], "reminded_overdue")
+
+        if minutes_left < 0:
+            if not t["reminded_overdue"]:
+                await send_overdue(application, t)
+                db.mark_reminded(t["id"], "reminded_overdue",
+                                 *(flag for flag, *_ in REMINDER_LEVELS))
+            continue
+
+        for idx, (flag, minutes, label, urgent) in enumerate(REMINDER_LEVELS):
+            if minutes_left > minutes:
+                continue
+            if not t[flag]:
+                await send_reminder(application, t, label, urgent)
+                # the gentler reminders are moot now — retire them together
+                db.mark_reminded(t["id"], flag, *(f for f, *_ in REMINDER_LEVELS[idx + 1:]))
+            break
 
 
 async def morning_digest(application):
@@ -1109,6 +1220,8 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("deadline", deadline_command))
     app.add_handler(CommandHandler("reassign", reassign_command))
+    app.add_handler(CommandHandler("edit", edit_command))
+    app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(done_callback, pattern=r"^done:\d+$"))
