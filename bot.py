@@ -115,7 +115,7 @@ def parse_deadline(s: str) -> datetime:
     raise ValueError(f"Cannot parse: {s}")
 
 
-def parse_task_with_claude(message_text: str, chat_id: int = None) -> list[dict]:
+def parse_task_with_claude(message_text: str, chat_id: int = None, reply_context: str = None) -> list[dict]:
     import time
     now = now_kyiv()
     now_str = now.strftime("%Y-%m-%dT%H:%M:%S")
@@ -152,10 +152,18 @@ has_task: false ТІЛЬКИ якщо реально немає виконавц
 
     for attempt in range(3):
         try:
+            content = message_text
+            if reply_context:
+                # a manager often adds to an earlier message ("і ще прайс до пʼятниці"),
+                # which is unparseable on its own
+                content = (
+                    f"Повідомлення, на яке відповідають (контекст):\n{reply_context}\n\n"
+                    f"Нове повідомлення (з нього і став задачу):\n{message_text}"
+                )
             response = claude.messages.create(
                 model="claude-sonnet-4-6", max_tokens=600,
                 system=system_prompt,
-                messages=[{"role": "user", "content": message_text}],
+                messages=[{"role": "user", "content": content}],
             )
             raw = response.content[0].text
             logger.info(f"Claude raw: {raw}")
@@ -176,7 +184,7 @@ has_task: false ТІЛЬКИ якщо реально немає виконавц
     return [{"has_task": False}]
 
 
-def parse_voice(audio_path: str, chat_id: int = None) -> tuple[str, list[dict]]:
+def parse_voice(audio_path: str, chat_id: int = None, reply_context: str = None) -> tuple[str, list[dict]]:
     """Returns (transcription, parsed_tasks). transcription is "" if unrecognizable."""
     import subprocess
     import speech_recognition as sr
@@ -204,7 +212,7 @@ def parse_voice(audio_path: str, chat_id: int = None) -> tuple[str, list[dict]]:
             os.remove(wav_path)
 
     logger.info(f"Voice transcription: {text}")
-    return text, parse_task_with_claude(text, chat_id)
+    return text, parse_task_with_claude(text, chat_id, reply_context)
 
 
 SNOOZE_OPTIONS = {"1h": timedelta(hours=1), "3h": timedelta(hours=3), "1d": timedelta(days=1)}
@@ -262,20 +270,39 @@ async def save_and_reply(update, context, result, source=""):
         member = db.get_member(chat_id, raw_assignee)
     tag = f"@{member['username']}" if member and member.get("username") else raw_assignee
 
+    now = now_kyiv()
     task_id = db.add_task(
         chat_id=chat_id, task_text=result["task"], assignee=tag,
         deadline=deadline.isoformat(), created_by=update.message.from_user.first_name,
-        created_at=now_kyiv().isoformat(),
+        created_at=now.isoformat(),
     )
+
+    warnings = []
+    if not member:
+        # Claude could match a name nobody in the roster has — the task would sit
+        # there with no DM and no reminders, and nobody would know.
+        warnings.append(
+            f"⚠️ {raw_assignee} не в команді — нагадувань в особисті не буде.\n"
+            f"Додай: /add {raw_assignee.lstrip('@')} @username"
+        )
+    elif not member.get("started"):
+        warnings.append(
+            f"⚠️ {tag} ще не натиснув(ла) Start у бота — задача видна лише в групі"
+        )
+    if deadline < now:
+        # already-late deadlines happen ("до 10:00" said at 15:00); say so instead
+        # of letting the overdue announcement fire a minute later as a surprise
+        warnings.append(f"⚠️ Дедлайн у минулому. Перенести: /deadline {task_id} дд.мм гг:хх")
+        db.mark_reminded(task_id, "reminded_overdue", "reminded_1d", "reminded_2h", "reminded_15m")
 
     deadline_fmt = deadline.strftime("%d.%m.%Y %H:%M")
     suffix = f" ({source})" if source else ""
     kb = done_keyboard(task_id)
 
-    await update.message.reply_text(
-        f"✅ Задача #{task_id} зафіксована{suffix}\n👤 {tag}\n📋 {result['task']}\n📅 {deadline_fmt}",
-        reply_markup=kb,
-    )
+    text = f"✅ Задача #{task_id} зафіксована{suffix}\n👤 {tag}\n📋 {result['task']}\n📅 {deadline_fmt}"
+    if warnings:
+        text += "\n\n" + "\n".join(warnings)
+    await update.message.reply_text(text, reply_markup=kb)
 
     if member and member.get("user_id"):
         try:
@@ -463,12 +490,26 @@ async def track_member(update, context):
         logger.warning(f"track_member failed: {e}")
 
 
+def reply_context_of(message) -> str | None:
+    """Text of the message being replied to — skipping the bot's own posts,
+    which are confirmations rather than task context."""
+    replied = getattr(message, "reply_to_message", None)
+    if not replied:
+        return None
+    if getattr(replied.from_user, "is_bot", False):
+        return None
+    return replied.text or replied.caption or None
+
+
 async def handle_message(update, context):
     if not update.message or not update.message.text:
         return
     if not is_allowed_to_assign(update.message.chat_id, update.message.from_user.id):
         return
-    results = await asyncio.to_thread(parse_task_with_claude, update.message.text, update.message.chat_id)
+    results = await asyncio.to_thread(
+        parse_task_with_claude, update.message.text, update.message.chat_id,
+        reply_context_of(update.message),
+    )
     for result in results:
         await save_and_reply(update, context, result)
 
@@ -483,7 +524,9 @@ async def handle_voice(update, context):
     try:
         file = await context.bot.get_file(voice.file_id)
         await file.download_to_drive(audio_path)
-        transcription, results = await asyncio.to_thread(parse_voice, audio_path, update.message.chat_id)
+        transcription, results = await asyncio.to_thread(
+            parse_voice, audio_path, update.message.chat_id, reply_context_of(update.message)
+        )
         any_saved = False
         for result in results:
             if await save_and_reply(update, context, result, source="з голосу"):
@@ -1170,7 +1213,7 @@ async def help_command(update, context):
         "/edit <id> текст — уточнити формулювання\n"
         "/export — усі задачі групи у CSV\n"
         "/repeat — повторювані задачі (щодня/щотижня)\n"
-        "/stats [дні] — статистика (напр. /stats 7)\n"
+        "/stats [ім'я] [дні] — статистика (напр. /stats Андрій 7)\n"
         "/team — склад команди\n"
         "/add ім'я @username — додати людину\n"
         "/manager ім'я [remove] — права ставити задачі\n"
@@ -1179,36 +1222,71 @@ async def help_command(update, context):
     )
 
 
-async def stats_command(update, context):
-    """/stats — за весь час, /stats 7 — за останні 7 днів."""
-    days = None
-    if context.args:
-        try:
-            days = int(context.args[0])
-            if days < 1:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("Використання: /stats  або  /stats 7  (за останні N днів)")
-            return
+def stats_line(s: dict) -> str:
+    rate = (s["on_time"] / s["total"] * 100) if s["total"] else 0
+    return (
+        f"👤 *{md(s['assignee'])}*\n"
+        f"   Всього: {s['total']} | Вчасно: {s['on_time']} | "
+        f"Запізно: {s['late']} | Прострочено: {s['overdue']}\n"
+        f"   Ефективність: {rate:.0f}%\n"
+    )
 
+
+async def stats_command(update, context):
+    """/stats — за весь час, /stats 7 — за N днів, /stats Андрій [7] — по людині."""
+    days, name = None, None
+    for arg in context.args:
+        if arg.isdigit():
+            days = int(arg)
+        else:
+            name = arg
+    if days is not None and days < 1:
+        await update.message.reply_text("Використання: /stats [ім'я] [дні], напр. /stats Андрій 7")
+        return
+
+    chat_id = update.message.chat_id
     now = now_kyiv()
     since = (now - timedelta(days=days)).isoformat() if days else None
-    stats = db.get_stats(update.message.chat_id, now.isoformat(), since)
+    stats = db.get_stats(chat_id, now.isoformat(), since)
+    period_suffix = f" за {days} дн." if days else ""
+
+    if name:
+        member = (db.get_member_by_username(chat_id, name) if name.startswith("@")
+                  else db.get_member(chat_id, name))
+        wanted = {name.lower()}
+        if member:
+            wanted.add(member["name"].lower())
+            if member.get("username"):
+                wanted.add(f"@{member['username']}".lower())
+        stats = [s for s in stats if s["assignee"].lower() in wanted]
+        who = member["name"] if member else name
+        if not stats:
+            await update.message.reply_text(f"У {who} немає задач{period_suffix}")
+            return
+
+        lines = [f"📊 *{md(who)}{period_suffix}:*\n", stats_line(stats[0])]
+        hanging = [
+            t for t in db.get_active_tasks(chat_id)
+            if t["assignee"].lower() in wanted and datetime.fromisoformat(t["deadline"]) < now
+        ]
+        if hanging:
+            lines.append("🔴 *Висить прострочене:*")
+            for t in hanging[:10]:
+                deadline = datetime.fromisoformat(t["deadline"])
+                lines.append(f"• #{t['id']} {md(t['task_text'])} — з {deadline.strftime('%d.%m %H:%M')}")
+            if len(hanging) > 10:
+                lines.append(f"…та ще {len(hanging) - 10}")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
     if not stats:
         await update.message.reply_text(
             f"За останні {days} дн. задач не було" if days else "Немає даних"
         )
         return
-    header = f"📊 *Статистика за {days} дн.:*\n" if days else "📊 *Статистика:*\n"
-    lines = [header]
+    lines = [f"📊 *Статистика{period_suffix}:*\n"]
     for s in stats:
-        rate = (s["on_time"] / s["total"] * 100) if s["total"] else 0
-        lines.append(
-            f"👤 *{md(s['assignee'])}*\n"
-            f"   Всього: {s['total']} | Вчасно: {s['on_time']} | "
-            f"Запізно: {s['late']} | Прострочено: {s['overdue']}\n"
-            f"   Ефективність: {rate:.0f}%\n"
-        )
+        lines.append(stats_line(s))
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
