@@ -322,8 +322,11 @@ async def save_and_reply(update, context, result, source=""):
     return True
 
 
-async def close_task(context, task_id: int, by_user) -> bool:
-    """Mark task done and announce in the group. Returns True if closed now."""
+async def close_task(context, task_id: int, by_user, proof=None) -> bool:
+    """Mark task done and announce in the group. `proof` is an (file_id, kind)
+    pair sent along with the announcement instead of a plain message, so the
+    invoice scan or the photo of the goods lands next to the closed task.
+    Returns True if closed now."""
     task = db.get_task(task_id)
     if not task or task["is_done"]:
         return False
@@ -334,15 +337,17 @@ async def close_task(context, task_id: int, by_user) -> bool:
     status = format_late(deadline, done_at)
 
     closer = f"@{by_user.username}" if by_user.username else by_user.first_name
+    text = f"✅ {closer} закрив(ла) задачу #{task_id} {status}\n📋 {task['task_text']}"
 
     try:
-        await context.bot.send_message(
-            chat_id=task["chat_id"],
-            text=(
-                f"✅ {closer} закрив(ла) задачу #{task_id} {status}\n"
-                f"📋 {task['task_text']}"
-            ),
-        )
+        if proof:
+            file_id, kind = proof
+            send = context.bot.send_photo if kind == "photo" else context.bot.send_document
+            key = "photo" if kind == "photo" else "document"
+            await send(chat_id=task["chat_id"], caption=f"{text}\n📎 з підтвердженням",
+                       **{key: file_id})
+        else:
+            await context.bot.send_message(chat_id=task["chat_id"], text=text)
     except Exception as e:
         logger.error(f"Group announce failed: {e}")
     return True
@@ -548,6 +553,117 @@ async def handle_voice(update, context):
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
+
+
+TASK_ID_RE = re.compile(r"#(\d+)")
+
+
+def task_id_from_message(message) -> int | None:
+    """Task number from the caption ("#12 готово") or from the bot message
+    the file is a reply to — every bot post carries the task's #id."""
+    replied = getattr(message, "reply_to_message", None)
+    sources = [message.caption]
+    if replied:
+        sources += [replied.text, getattr(replied, "caption", None)]
+    for text in sources:
+        match = TASK_ID_RE.search(text) if text else None
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def own_open_tasks(user, chat_type, chat_id) -> list[dict]:
+    if chat_type == "private":
+        return db.get_active_tasks_for_user(user.id)
+    tag = f"@{user.username}".lower() if user.username else None
+    member = db.get_member_by_user_id(chat_id, user.id)
+    wanted = {t for t in (tag, member["name"].lower() if member else None) if t}
+    return [t for t in db.get_active_tasks(chat_id) if t["assignee"].lower() in wanted]
+
+
+async def handle_proof(update, context):
+    """A photo or document from the assignee closes the task and stays with it.
+    In a group we act only on an explicit #id or a reply to the task message —
+    photos fly around a work chat all day and the bot must not react to them all.
+    In a DM a single open task is unambiguous enough."""
+    msg = update.message
+    if not msg or not (msg.photo or msg.document):
+        return
+    private = msg.chat.type == "private"
+    file_id, kind = ((msg.photo[-1].file_id, "photo") if msg.photo
+                     else (msg.document.file_id, "document"))
+
+    task_id = task_id_from_message(msg)
+    if task_id is None:
+        if not private:
+            return
+        candidates = own_open_tasks(msg.from_user, msg.chat.type, msg.chat_id)
+        if not candidates:
+            return
+        if len(candidates) > 1:
+            lines = ["📎 До якої задачі це підтвердження? Вкажи номер у підписі до файлу:\n"]
+            for t in candidates[:10]:
+                lines.append(f"• #{t['id']} {md(t['task_text'])}")
+            await msg.reply_text("\n".join(lines), parse_mode="Markdown")
+            return
+        task_id = candidates[0]["id"]
+
+    task = db.get_task(task_id)
+    if not task:
+        if private:
+            await msg.reply_text(f"❌ Задача #{task_id} не знайдена")
+        return
+    if not await can_act_on_task(context, task, msg.from_user):
+        return
+
+    db.attach_proof(task_id, file_id, kind)
+    if task["is_done"]:
+        await msg.reply_text(f"📎 Підтвердження додано до вже закритої задачі #{task_id}")
+        return
+
+    closed = await close_task(context, task_id, msg.from_user, proof=(file_id, kind))
+    if closed:
+        deadline = datetime.fromisoformat(task["deadline"])
+        status = format_late(deadline, now_kyiv())
+        await msg.reply_text(f"✅ Задача #{task_id} закрита {status} — підтвердження збережено")
+
+
+async def undone_command(update, context):
+    """/undone <id> — повернути в роботу задачу, закриту помилково."""
+    user = update.message.from_user
+    if not context.args:
+        await update.message.reply_text("Використання: /undone <id>  — повернути задачу в роботу")
+        return
+    try:
+        task_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID має бути числом")
+        return
+
+    task = db.get_task(task_id)
+    if not task:
+        await update.message.reply_text(f"❌ Задача #{task_id} не знайдена")
+        return
+    if not task["is_done"]:
+        await update.message.reply_text(f"Задача #{task_id} і так в роботі")
+        return
+    if not (is_allowed_to_assign(task["chat_id"], user.id)
+            or await is_chat_admin(context.bot, task["chat_id"], user.id)):
+        await update.message.reply_text("❌ Повернути задачу в роботу може лише менеджер або адмін")
+        return
+
+    db.reopen_task(task_id)
+    deadline = datetime.fromisoformat(task["deadline"])
+    who = f"@{user.username}" if user.username else user.first_name
+    text = (
+        f"↩️ {md(who)} повернув(ла) задачу #{task_id} в роботу\n"
+        f"📋 {md(task['task_text'])}\n"
+        f"📅 Дедлайн: {deadline.strftime('%d.%m.%Y %H:%M')}"
+    )
+    if deadline < now_kyiv():
+        text += f"\n⚠️ Дедлайн у минулому. Перенести: /deadline {task_id} дд.мм гг:хх"
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=done_keyboard(task_id))
+    await notify_task_parties(context, task, update.message.chat_id, user.id, text)
 
 
 async def start_command(update, context):
@@ -972,7 +1088,7 @@ def tasks_csv(tasks, now: datetime) -> bytes:
     writer = csv.writer(buf, delimiter=";")
     writer.writerow([
         "id", "виконавець", "задача", "дедлайн", "поставив",
-        "створено", "статус", "закрито", "запізнення (хв)",
+        "створено", "статус", "закрито", "запізнення (хв)", "підтвердження",
     ])
     for t in tasks:
         deadline = datetime.fromisoformat(t["deadline"])
@@ -990,6 +1106,7 @@ def tasks_csv(tasks, now: datetime) -> bytes:
             t["id"], t["assignee"], t["task_text"], deadline.strftime("%d.%m.%Y %H:%M"),
             t.get("created_by") or "", (t.get("created_at") or "")[:16].replace("T", " "),
             status, done_at.strftime("%d.%m.%Y %H:%M") if done_at else "", late_min,
+            "так" if t.get("proof_file_id") else "",
         ])
     return buf.getvalue().encode("utf-8-sig")
 
@@ -1203,10 +1320,13 @@ async def help_command(update, context):
         "🤖 *Що я вмію*\n\n"
         "Просто напиши або надиктуй у групі: «Максим, зроби звіт до завтра 10:00» — "
         "я сам розпізнаю виконавця й дедлайн.\n\n"
+        "Фото або скан у відповідь на задачу (чи з «#12» у підписі) закриває її "
+        "й лишається підтвердженням.\n\n"
         "*Команди*\n"
         "/tasks [ім'я] — активні задачі (в особистих — твої власні)\n"
         "/task ім'я | опис | дд.мм.рррр гг:хх — задача вручну\n"
         "/done <id> — закрити задачу\n"
+        "/undone <id> — повернути закриту задачу в роботу\n"
         "/cancel <id> — скасувати помилкову задачу\n"
         "/deadline <id> дд.мм гг:хх — перенести дедлайн\n"
         "/reassign <id> ім'я — передати задачу іншому\n"
@@ -1505,6 +1625,7 @@ def main():
     app.add_handler(MessageHandler(filters.ALL, track_member), group=1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_proof))
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("add", add_command))
     app.add_handler(CommandHandler("team", team_command))
@@ -1517,6 +1638,7 @@ def main():
     app.add_handler(CommandHandler("deadline", deadline_command))
     app.add_handler(CommandHandler("reassign", reassign_command))
     app.add_handler(CommandHandler("edit", edit_command))
+    app.add_handler(CommandHandler("undone", undone_command))
     app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CommandHandler("repeat", repeat_command))
     app.add_handler(CommandHandler("unrepeat", unrepeat_command))

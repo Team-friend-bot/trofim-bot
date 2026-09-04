@@ -87,6 +87,13 @@ class Database:
                 conn.execute("ALTER TABLE tasks ADD COLUMN is_cancelled INTEGER DEFAULT 0")
             except Exception:
                 pass
+            # Migration: proof of completion — the Telegram file_id of the photo or
+            # document the assignee sent when closing (invoice scan, photo of goods).
+            for column in ("proof_file_id TEXT", "proof_kind TEXT"):
+                try:
+                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {column}")
+                except Exception:
+                    pass
             self._normalize_timestamps(conn)
 
     @staticmethod
@@ -377,4 +384,21 @@ class Database:
         with self._get_conn() as conn:
             conn.execute(
                 "UPDATE recurring SET last_created_date = ? WHERE id = ?", (date_iso, template_id)
+            )
+
+    def attach_proof(self, task_id, file_id, kind):
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE tasks SET proof_file_id = ?, proof_kind = ? WHERE id = ?",
+                (file_id, kind, task_id)
+            )
+
+    def reopen_task(self, task_id):
+        """Undo a close: back to open, reminders armed again from scratch."""
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE tasks SET is_done = 0, is_cancelled = 0, done_at = NULL, "
+                "reminded_1d = 0, reminded_2h = 0, reminded_15m = 0, reminded_overdue = 0 "
+                "WHERE id = ?",
+                (task_id,)
             )
