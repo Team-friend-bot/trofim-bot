@@ -26,6 +26,10 @@ class Database:
     def _get_conn(self):
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        # SQLite's own ulower() only folds ASCII: ulower('ПРАЙС') stays 'ПРАЙС'.
+        # Every case-insensitive lookup here is on Ukrainian text — names, task
+        # texts — so use Python's Unicode-aware lower instead.
+        conn.create_function("ulower", 1, lambda value: value.lower() if value is not None else None)
         return conn
 
     def _init_db(self):
@@ -147,7 +151,7 @@ class Database:
     def get_member_by_username(self, chat_id, username):
         with self._get_conn() as conn:
             row = conn.execute(
-                "SELECT * FROM members WHERE chat_id = ? AND LOWER(username) = LOWER(?)",
+                "SELECT * FROM members WHERE chat_id = ? AND ulower(username) = ulower(?)",
                 (chat_id, username.lstrip("@"))
             ).fetchone()
             return dict(row) if row else None
@@ -225,7 +229,7 @@ class Database:
     def get_member(self, chat_id, name):
         with self._get_conn() as conn:
             row = conn.execute(
-                "SELECT * FROM members WHERE chat_id = ? AND LOWER(name) = LOWER(?)",
+                "SELECT * FROM members WHERE chat_id = ? AND ulower(name) = ulower(?)",
                 (chat_id, name)
             ).fetchone()
             return dict(row) if row else None
@@ -241,14 +245,14 @@ class Database:
     def remove_member(self, chat_id, name):
         with self._get_conn() as conn:
             conn.execute(
-                "DELETE FROM members WHERE chat_id = ? AND LOWER(name) = LOWER(?)",
+                "DELETE FROM members WHERE chat_id = ? AND ulower(name) = ulower(?)",
                 (chat_id, name)
             )
 
     def set_manager(self, chat_id, name, is_manager: bool):
         with self._get_conn() as conn:
             conn.execute(
-                "UPDATE members SET is_manager = ? WHERE chat_id = ? AND LOWER(name) = LOWER(?)",
+                "UPDATE members SET is_manager = ? WHERE chat_id = ? AND ulower(name) = ulower(?)",
                 (1 if is_manager else 0, chat_id, name)
             )
 
@@ -261,12 +265,12 @@ class Database:
             return
         with self._get_conn() as conn:
             row = conn.execute(
-                "SELECT name FROM members WHERE chat_id = ? AND LOWER(username) = LOWER(?)",
+                "SELECT name FROM members WHERE chat_id = ? AND ulower(username) = ulower(?)",
                 (chat_id, username)
             ).fetchone()
             if row:
                 conn.execute(
-                    "UPDATE members SET user_id = ? WHERE chat_id = ? AND LOWER(username) = LOWER(?)",
+                    "UPDATE members SET user_id = ? WHERE chat_id = ? AND ulower(username) = ulower(?)",
                     (user_id, chat_id, username)
                 )
             else:
@@ -280,7 +284,7 @@ class Database:
         """Called on private /start — marks the member as DM-reachable (started=1)."""
         with self._get_conn() as conn:
             cursor = conn.execute(
-                "UPDATE members SET user_id = ?, started = 1 WHERE LOWER(username) = LOWER(?)",
+                "UPDATE members SET user_id = ?, started = 1 WHERE ulower(username) = ulower(?)",
                 (user_id, username)
             )
             return cursor.rowcount
@@ -308,8 +312,8 @@ class Database:
                 JOIN members m ON m.chat_id = t.chat_id
                 WHERE m.user_id = ?
                   AND t.is_done = 0 AND COALESCE(t.is_cancelled, 0) = 0
-                  AND (LOWER(t.assignee) = LOWER('@' || COALESCE(m.username, ''))
-                       OR LOWER(t.assignee) = LOWER(m.name))
+                  AND (ulower(t.assignee) = ulower('@' || COALESCE(m.username, ''))
+                       OR ulower(t.assignee) = ulower(m.name))
                 ORDER BY t.deadline
             """, (user_id,)).fetchall()
             return [dict(row) for row in rows]
@@ -402,3 +406,23 @@ class Database:
                 "WHERE id = ?",
                 (task_id,)
             )
+
+    def search_tasks(self, chat_id, query, limit=20):
+        """Substring search over task text, closed and cancelled ones included —
+        'а що там було по прайсу' is usually about something already finished."""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE chat_id = ? AND ulower(task_text) LIKE '%' || ulower(?) || '%' "
+                "ORDER BY id DESC LIMIT ?",
+                (chat_id, query, limit)
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_overdue_tasks(self, chat_id, now_iso):
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE chat_id = ? AND is_done = 0 "
+                "AND COALESCE(is_cancelled, 0) = 0 AND deadline < ? ORDER BY deadline",
+                (chat_id, now_iso)
+            ).fetchall()
+            return [dict(row) for row in rows]

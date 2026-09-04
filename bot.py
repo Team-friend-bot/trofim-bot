@@ -94,6 +94,36 @@ def is_due_today(period: str, day: date) -> bool:
     return False
 
 
+TELEGRAM_LIMIT = 3900  # 4096 minus room for the entities Telegram counts
+
+
+def chunk_lines(lines, limit: int = TELEGRAM_LIMIT) -> list[str]:
+    """Telegram rejects a message over 4096 chars outright, so a team with a few
+    dozen open tasks used to get nothing at all from /tasks — just an error DM to
+    the owner. Split on line boundaries instead."""
+    chunks, current, size = [], [], 0
+    for line in lines:
+        line_size = len(line) + 1
+        if current and size + line_size > limit:
+            chunks.append("\n".join(current))
+            current, size = [], 0
+        current.append(line)
+        size += line_size
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [""]
+
+
+async def reply_lines(message, lines, **kwargs):
+    for chunk in chunk_lines(lines):
+        await message.reply_text(chunk, **kwargs)
+
+
+async def send_lines(bot_, chat_id, lines, **kwargs):
+    for chunk in chunk_lines(lines):
+        await bot_.send_message(chat_id=chat_id, text=chunk, **kwargs)
+
+
 def md(text) -> str:
     """Escape user-supplied text for parse_mode="Markdown".
     Telegram rejects the whole message when an entity is left unclosed, so an
@@ -604,7 +634,7 @@ async def handle_proof(update, context):
             lines = ["📎 До якої задачі це підтвердження? Вкажи номер у підписі до файлу:\n"]
             for t in candidates[:10]:
                 lines.append(f"• #{t['id']} {md(t['task_text'])}")
-            await msg.reply_text("\n".join(lines), parse_mode="Markdown")
+            await reply_lines(msg, lines, parse_mode="Markdown")
             return
         task_id = candidates[0]["id"]
 
@@ -743,7 +773,7 @@ async def team_command(update, context):
         role = " 👔 менеджер" if m.get("is_manager") else ""
         lines.append(f"{connected} {md(m['name'])} → @{md(m['username'])}{role}")
     lines.append("\n✅ — підключений  ⚠️ — ще не написав /start\n👔 — може ставити задачі")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await reply_lines(update.message, lines, parse_mode="Markdown")
 
 
 async def manager_command(update, context):
@@ -849,7 +879,72 @@ async def tasks_command(update, context):
                 f"{icon} #{t['id']} | {md(t['assignee'])} | {md(t['task_text'])} | "
                 f"{deadline.strftime('%d.%m %H:%M')}"
             )
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await reply_lines(update.message, lines, parse_mode="Markdown")
+
+
+def task_status_icon(task: dict, now: datetime) -> str:
+    if task.get("is_cancelled"):
+        return "🗑"
+    if task["is_done"]:
+        return "✅"
+    return "🔴" if datetime.fromisoformat(task["deadline"]) < now else "🟡"
+
+
+async def find_command(update, context):
+    """/find прайс — знайти задачу за словом, включно з уже закритими."""
+    if update.message.chat.type == "private":
+        await update.message.reply_text("Пошук працює в групі — шукає по задачах цієї групи")
+        return
+    query = " ".join(context.args).strip()
+    if len(query) < 3:
+        await update.message.reply_text("Використання: /find <слово>  (мінімум 3 символи)")
+        return
+
+    found = db.search_tasks(update.message.chat_id, query)
+    if not found:
+        await update.message.reply_text(f"Нічого не знайшов по «{query}»")
+        return
+
+    now = now_kyiv()
+    lines = [f"🔍 *Знайдено по «{md(query)}»:*\n"]
+    for t in found:
+        deadline = datetime.fromisoformat(t["deadline"])
+        tail = ""
+        if t["is_done"] and t.get("done_at") and not t.get("is_cancelled"):
+            tail = f" · закрито {datetime.fromisoformat(t['done_at']).strftime('%d.%m')}"
+        lines.append(
+            f"{task_status_icon(t, now)} #{t['id']} | {md(t['assignee'])} | {md(t['task_text'])} | "
+            f"{deadline.strftime('%d.%m %H:%M')}{tail}"
+        )
+    await reply_lines(update.message, lines, parse_mode="Markdown")
+
+
+async def overdue_command(update, context):
+    """/overdue — що горить прямо зараз, по людях, від найдавнішого."""
+    if update.message.chat.type == "private":
+        await update.message.reply_text("Команду треба писати в групі — зведення по задачах групи")
+        return
+
+    now = now_kyiv()
+    tasks = db.get_overdue_tasks(update.message.chat_id, now.isoformat())
+    if not tasks:
+        await update.message.reply_text("🎉 Прострочених задач немає")
+        return
+
+    by_person = {}
+    for t in tasks:
+        by_person.setdefault(t["assignee"], []).append(t)
+
+    lines = [f"🔴 *Прострочено: {len(tasks)}*\n"]
+    for assignee, items in sorted(by_person.items(), key=lambda kv: -len(kv[1])):
+        lines.append(f"👤 *{md(assignee)}* — {len(items)}")
+        for t in items:
+            deadline = datetime.fromisoformat(t["deadline"])
+            hours = (now - deadline).total_seconds() / 3600
+            age = f"{int(hours)} год" if hours < 48 else f"{int(hours / 24)} дн"
+            lines.append(f"   • #{t['id']} {md(t['task_text'])} — висить {age}")
+        lines.append("")
+    await reply_lines(update.message, lines, parse_mode="Markdown")
 
 
 async def done_command(update, context):
@@ -1167,7 +1262,7 @@ async def repeat_command(update, context):
             "Період: щодня, будні, пн…нд або число місяця (1–31)\n"
             "Приклад: `/repeat пн 12:00 | Андрій | звіт по закупівлях за тиждень`"
         )
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await reply_lines(update.message, lines, parse_mode="Markdown")
         return
 
     if not (is_allowed_to_assign(chat_id, user.id)
@@ -1333,6 +1428,8 @@ async def help_command(update, context):
         "/edit <id> текст — уточнити формулювання\n"
         "/export — усі задачі групи у CSV\n"
         "/repeat — повторювані задачі (щодня/щотижня)\n"
+        "/overdue — що горить прямо зараз\n"
+        "/find <слово> — знайти задачу, зокрема закриту\n"
         "/stats [ім'я] [дні] — статистика (напр. /stats Андрій 7)\n"
         "/team — склад команди\n"
         "/add ім'я @username — додати людину\n"
@@ -1396,7 +1493,7 @@ async def stats_command(update, context):
                 lines.append(f"• #{t['id']} {md(t['task_text'])} — з {deadline.strftime('%d.%m %H:%M')}")
             if len(hanging) > 10:
                 lines.append(f"…та ще {len(hanging) - 10}")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await reply_lines(update.message, lines, parse_mode="Markdown")
         return
 
     if not stats:
@@ -1407,7 +1504,7 @@ async def stats_command(update, context):
     lines = [f"📊 *Статистика{period_suffix}:*\n"]
     for s in stats:
         lines.append(stats_line(s))
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await reply_lines(update.message, lines, parse_mode="Markdown")
 
 
 async def send_reminder(application, task, when_text: str, urgent: bool):
@@ -1536,9 +1633,7 @@ async def morning_digest(application):
         lines.append("\nЗакрити задачу: /done <id> або кнопка ✅ під нею.")
 
         try:
-            await application.bot.send_message(
-                chat_id=person["user_id"], text="\n".join(lines), parse_mode="Markdown"
-            )
+            await send_lines(application.bot, person["user_id"], lines, parse_mode="Markdown")
         except Exception as e:
             logger.warning(f"Morning digest DM to {person['user_id']} failed: {e}")
 
@@ -1563,9 +1658,7 @@ async def weekly_report(application):
                 parts.append(f"🔴 прострочено {s['overdue']}")
             lines.append(f"👤 *{md(s['assignee'])}* — " + ", ".join(parts))
         try:
-            await application.bot.send_message(
-                chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown"
-            )
+            await send_lines(application.bot, chat_id, lines, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Weekly report to {chat_id} failed: {e}")
 
@@ -1587,9 +1680,7 @@ async def connect_digest(application):
         "тоді задачі й нагадування йтимуть їм в особисті. У групі все працює й без цього."
     )
     try:
-        await application.bot.send_message(
-            chat_id=OWNER_ID, text="\n".join(lines), parse_mode="Markdown"
-        )
+        await send_lines(application.bot, OWNER_ID, lines, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"connect_digest failed: {e}")
 
@@ -1639,6 +1730,8 @@ def main():
     app.add_handler(CommandHandler("reassign", reassign_command))
     app.add_handler(CommandHandler("edit", edit_command))
     app.add_handler(CommandHandler("undone", undone_command))
+    app.add_handler(CommandHandler("find", find_command))
+    app.add_handler(CommandHandler("overdue", overdue_command))
     app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CommandHandler("repeat", repeat_command))
     app.add_handler(CommandHandler("unrepeat", unrepeat_command))
