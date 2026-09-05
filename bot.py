@@ -214,6 +214,38 @@ has_task: false ТІЛЬКИ якщо реально немає виконавц
     return [{"has_task": False}]
 
 
+VOICE_LANGUAGES = ("uk-UA", "ru-RU")
+
+
+def recognize_bilingual(recognizer, audio) -> tuple[str, str | None, float]:
+    """The team speaks Ukrainian and Russian in the same chat, and a Russian
+    message run through uk-UA recognition comes back as nonsense the parser then
+    has to guess at. Recognise with both and keep whichever Google is more sure
+    about. Returns ("", None, 0.0) when neither language produced anything."""
+    import speech_recognition as sr
+
+    best = ("", None, 0.0)
+    for language in VOICE_LANGUAGES:
+        try:
+            result = recognizer.recognize_google(audio, language=language, show_all=True)
+        except sr.UnknownValueError:
+            continue
+        except Exception as e:
+            logger.warning(f"Recognition failed for {language}: {e}")
+            continue
+        alternatives = result.get("alternative") if isinstance(result, dict) else None
+        if not alternatives:
+            continue
+        top = alternatives[0]
+        text = (top.get("transcript") or "").strip()
+        # confidence is missing on some responses — treat it as a weak match
+        # rather than dropping the only transcription we have
+        confidence = float(top.get("confidence", 0.5) or 0.0)
+        if text and confidence > best[2]:
+            best = (text, language, confidence)
+    return best
+
+
 def parse_voice(audio_path: str, chat_id: int = None, reply_context: str = None) -> tuple[str, list[dict]]:
     """Returns (transcription, parsed_tasks). transcription is "" if unrecognizable."""
     import subprocess
@@ -234,14 +266,14 @@ def parse_voice(audio_path: str, chat_id: int = None, reply_context: str = None)
     try:
         with sr.AudioFile(wav_path) as source:
             audio = recognizer.record(source)
-        text = recognizer.recognize_google(audio, language="uk-UA")
-    except sr.UnknownValueError:
-        return "", [{"has_task": False}]
+        text, lang, confidence = recognize_bilingual(recognizer, audio)
     finally:
         if os.path.exists(wav_path):
             os.remove(wav_path)
 
-    logger.info(f"Voice transcription: {text}")
+    if not text:
+        return "", [{"has_task": False}]
+    logger.info(f"Voice transcription [{lang} conf={confidence:.2f}]: {text}")
     return text, parse_task_with_claude(text, chat_id, reply_context)
 
 
@@ -525,6 +557,34 @@ async def track_member(update, context):
         logger.warning(f"track_member failed: {e}")
 
 
+# A delegation always carries a time ("до 18:00", "завтра", "через годину") or
+# names somebody. Messages with neither are ordinary chat, and sending each of
+# them to Claude cost a request per message in a busy group.
+DEADLINE_HINT = re.compile(
+    r"\d|завтра|сьогодні|сегодня|післязавтра|послезавтра|через|терміново|срочно|"
+    r"ранку|утром|вечора|вечером|обід|обед|дедлайн|вихідн|выходн|тижн|недел|"
+    r"понеділ|вівтор|серед|четвер|п.ятниц|пятниц|субот|неділ|"
+    r"понедельн|вторн|сред|четверг|суббот|воскрес|\bдо\s",
+    re.IGNORECASE,
+)
+
+
+def looks_like_delegation(text: str, chat_id: int) -> bool:
+    """Cheap pre-filter for the Claude call. Deliberately generous: any digit,
+    any time word or any teammate's name lets the message through."""
+    if DEADLINE_HINT.search(text):
+        return True
+    lowered = text.lower()
+    for member in db.get_team(chat_id):
+        username = member.get("username")
+        if username and f"@{username}".lower() in lowered:
+            return True
+        name = (member.get("name") or "").lower()
+        if len(name) >= 4 and name[:4] in lowered:  # Андрію / Андрієві / Андрійко
+            return True
+    return False
+
+
 def reply_context_of(message) -> str | None:
     """Text of the message being replied to — skipping the bot's own posts,
     which are confirmations rather than task context."""
@@ -540,6 +600,9 @@ async def handle_message(update, context):
     if not update.message or not update.message.text:
         return
     if not is_allowed_to_assign(update.message.chat_id, update.message.from_user.id):
+        return
+    if not looks_like_delegation(update.message.text, update.message.chat_id):
+        logger.debug(f"Skipped (no assignee/deadline cue): {update.message.text[:60]}")
         return
     results = await asyncio.to_thread(
         parse_task_with_claude, update.message.text, update.message.chat_id,
