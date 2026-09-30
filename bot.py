@@ -739,9 +739,20 @@ async def connect_digest(application):
         logger.error(f"connect_digest failed: {e}")
 
 
+_last_error_notify: dict[str, datetime] = {}
+
+
 async def error_handler(update, context):
     err = context.error
     logger.error(f"Update caused error: {err}", exc_info=err)
+    # A getUpdates Conflict (two pollers on the same token) repeats every ~10 min
+    # until the duplicate is killed — dedup so it doesn't spam the owner each time.
+    key = f"{type(err).__name__}:{err}"
+    now = now_kyiv()
+    last = _last_error_notify.get(key)
+    if last and (now - last) < timedelta(minutes=15):
+        return
+    _last_error_notify[key] = now
     try:
         msg = f"⚠️ Помилка бота:\n{type(err).__name__}: {err}"
         if update and getattr(update, "effective_message", None):
@@ -752,7 +763,10 @@ async def error_handler(update, context):
 
 
 def main():
-    if os.environ.get("RAILWAY_ENVIRONMENT"):
+    # Railway no longer injects a bare RAILWAY_ENVIRONMENT (only RAILWAY_ENVIRONMENT_NAME/
+    # _ID and friends) — checking that exact name let this guard silently never fire.
+    # Match any RAILWAY_* var instead so it still works if Railway renames things again.
+    if any(k.startswith("RAILWAY_") for k in os.environ):
         logger.warning("Running on Railway — bot moved to the VPS deployment, exiting to avoid a polling conflict.")
         return
 
