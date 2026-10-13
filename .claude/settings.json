@@ -1,0 +1,41 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/trofim-prod-guard.py\"",
+            "timeout": 10,
+            "statusMessage": "Перевірка: не чіпаємо живий борд"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/devlog-session-end.py\"",
+            "timeout": 60,
+            "statusMessage": "Записую день у журнал розробок"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/verify-report-gate.py\"",
+            "timeout": 15,
+            "statusMessage": "Перевіряю, чи потрібна верифікація аналітики…"
+          }
+        ]
+      }
+    ]
+  }
+}
