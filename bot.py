@@ -137,15 +137,34 @@ def parse_voice(audio_path: str, chat_id: int = None) -> tuple[str, list[dict]]:
     try:
         with sr.AudioFile(wav_path) as source:
             audio = recognizer.record(source)
-        text = recognizer.recognize_google(audio, language="uk-UA")
-    except sr.UnknownValueError:
-        return "", [{"has_task": False}]
+
+        # Мов ДВІ: люди говорять і українською, і російською. Розпізнавання
+        # лише uk-UA калічило мішані голосові (той самий баг, що вже фіксили
+        # в manager_tracker/services/voice_transcriber.py). Пробуємо ОБИДВІ
+        # мови, беремо результат з вищою впевненістю Google.
+        best_text, best_conf = None, -1.0
+        for lang in ("uk-UA", "ru-RU"):
+            try:
+                res = recognizer.recognize_google(audio, language=lang, show_all=True)
+            except sr.UnknownValueError:
+                continue
+            alts = (res or {}).get("alternative") if isinstance(res, dict) else None
+            if not alts:
+                continue
+            candidate = (alts[0].get("transcript") or "").strip()
+            conf = float(alts[0].get("confidence", 0.5))
+            logger.info(f"STT {lang}: conf={conf:.2f} «{candidate[:60]}»")
+            if candidate and conf > best_conf:
+                best_text, best_conf = candidate, conf
     finally:
         if os.path.exists(wav_path):
             os.remove(wav_path)
 
-    logger.info(f"Voice transcription: {text}")
-    return text, parse_task_with_claude(text, chat_id)
+    if not best_text:
+        return "", [{"has_task": False}]
+
+    logger.info(f"Voice transcription: {best_text}")
+    return best_text, parse_task_with_claude(best_text, chat_id)
 
 
 SNOOZE_OPTIONS = {"1h": timedelta(hours=1), "3h": timedelta(hours=3), "1d": timedelta(days=1)}
