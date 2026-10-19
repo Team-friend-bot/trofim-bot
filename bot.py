@@ -118,53 +118,41 @@ has_task: false ТІЛЬКИ якщо реально немає виконавц
 
 
 def parse_voice(audio_path: str, chat_id: int = None) -> tuple[str, list[dict]]:
-    """Returns (transcription, parsed_tasks). transcription is "" if unrecognizable."""
-    import subprocess
-    import speech_recognition as sr
+    """Returns (transcription, parsed_tasks). transcription is "" if unrecognizable.
 
-    wav_path = audio_path.replace(".ogg", ".wav")
-    try:
-        subprocess.run(
-            ["ffmpeg", "-i", audio_path, "-ar", "16000", "-ac", "1", wav_path, "-y"],
-            capture_output=True, check=True, timeout=30,
-        )
-    except FileNotFoundError:
-        raise RuntimeError("ffmpeg_not_installed")
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"ffmpeg_error: {e.stderr.decode()[:200]}")
+    Uses OpenAI Whisper (hosted API, no local model) — switched from the free
+    Google Web Speech API because recognition quality stayed poor even after
+    the uk-UA/ru-RU dual-language fix: Whisper handles code-switched and noisy
+    Telegram voice messages far better, and needs no ffmpeg wav conversion
+    (accepts the .ogg/opus straight from Telegram).
+    """
+    import httpx
 
-    recognizer = sr.Recognizer()
-    try:
-        with sr.AudioFile(wav_path) as source:
-            audio = recognizer.record(source)
-
-        # Мов ДВІ: люди говорять і українською, і російською. Розпізнавання
-        # лише uk-UA калічило мішані голосові (той самий баг, що вже фіксили
-        # в manager_tracker/services/voice_transcriber.py). Пробуємо ОБИДВІ
-        # мови, беремо результат з вищою впевненістю Google.
-        best_text, best_conf = None, -1.0
-        for lang in ("uk-UA", "ru-RU"):
-            try:
-                res = recognizer.recognize_google(audio, language=lang, show_all=True)
-            except sr.UnknownValueError:
-                continue
-            alts = (res or {}).get("alternative") if isinstance(res, dict) else None
-            if not alts:
-                continue
-            candidate = (alts[0].get("transcript") or "").strip()
-            conf = float(alts[0].get("confidence", 0.5))
-            logger.info(f"STT {lang}: conf={conf:.2f} «{candidate[:60]}»")
-            if candidate and conf > best_conf:
-                best_text, best_conf = candidate, conf
-    finally:
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
-
-    if not best_text:
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if not openai_key:
+        logger.warning("OPENAI_API_KEY not set — voice transcription disabled")
         return "", [{"has_task": False}]
 
-    logger.info(f"Voice transcription: {best_text}")
-    return best_text, parse_task_with_claude(best_text, chat_id)
+    try:
+        with open(audio_path, "rb") as f:
+            resp = httpx.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {openai_key}"},
+                files={"file": (os.path.basename(audio_path), f, "audio/ogg")},
+                data={"model": "whisper-1"},
+                timeout=60,
+            )
+        resp.raise_for_status()
+        text = (resp.json().get("text") or "").strip()
+    except Exception as e:
+        logger.warning(f"Whisper transcription error: {e}")
+        return "", [{"has_task": False}]
+
+    if not text:
+        return "", [{"has_task": False}]
+
+    logger.info(f"Voice transcription: {text}")
+    return text, parse_task_with_claude(text, chat_id)
 
 
 SNOOZE_OPTIONS = {"1h": timedelta(hours=1), "3h": timedelta(hours=3), "1d": timedelta(days=1)}
